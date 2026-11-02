@@ -24,6 +24,10 @@ const PAD: f32 = 6.0;
 /// Textures of diagrams that are not on screen are dropped above this total, and drawn
 /// again when scrolled back to.
 const TEXTURE_BUDGET: usize = 256 << 20;
+/// Most pixels one diagram is drawn with: 128 MiB as RGBA, and the drawing is held twice
+/// (tiny-skia's pixmap and egui's image) before it is uploaded. The budget above only drops
+/// diagrams that are off screen, so it cannot bound a single one on screen.
+const MAX_PIXELS: usize = 32 << 20;
 /// A diagram that takes longer than this to lay out is given up on, so that the ones after
 /// it are still drawn.
 const LAYOUT_DEADLINE: Duration = Duration::from_secs(10);
@@ -32,6 +36,18 @@ const LAYOUT_DEADLINE: Duration = Duration::from_secs(10);
 pub fn is_mermaid(lang: Option<&str>) -> bool {
     lang.and_then(|l| l.split(|c: char| c.is_whitespace() || c == '{').next())
         .is_some_and(|l| l.eq_ignore_ascii_case("mermaid"))
+}
+
+/// The texture size for a diagram shown `px` physical pixels large. A diagram can be far
+/// larger than the screen (a big graph, or one whose spacing is set very wide), and only
+/// its visible part is ever on screen, so above the GPU's `max_side` or `MAX_PIXELS` in
+/// all it is drawn smaller, keeping its shape, and stretched.
+pub fn texture_size(px: Vec2, max_side: f32) -> [usize; 2] {
+    let px = px.round();
+    let fit = (max_side / px.max_elem()).min((MAX_PIXELS as f32 / (px.x * px.y)).sqrt());
+    // Rounded down when shrunk, so the result never goes over either limit.
+    let px = if fit < 1.0 { (px * fit).floor() } else { px };
+    [px.x.max(1.0) as usize, px.y.max(1.0) as usize]
 }
 
 type Key = (u64, bool);
@@ -231,7 +247,12 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
                 log::debug!("laid out a Mermaid diagram in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
                 Done::Layout { key, result }
             }
-            Job::Raster { key, tree, size } => Done::Raster { key, image: rasterize(&tree, size) },
+            Job::Raster { key, tree, size } => {
+                let t0 = Instant::now();
+                let image = rasterize(&tree, size);
+                log::debug!("drew a {}x{} px Mermaid diagram in {:.1} ms", size[0], size[1], t0.elapsed().as_secs_f64() * 1000.0);
+                Done::Raster { key, image }
+            }
         };
         if tx.send(done).is_err() {
             return;
@@ -468,5 +489,22 @@ mod tests {
         assert!(!is_mermaid(Some("mermaidx")));
         assert!(!is_mermaid(Some("rust")));
         assert!(!is_mermaid(None));
+    }
+
+    #[test]
+    fn texture_size_is_capped_by_side_and_area() {
+        // Small enough: the size shown, rounded.
+        assert_eq!(texture_size(vec2(1200.4, 800.6), 16384.0), [1200, 801]);
+        assert_eq!(texture_size(vec2(0.2, 0.0), 16384.0), [1, 1]);
+        // Too long for the GPU: shrunk to its limit, same shape.
+        assert_eq!(texture_size(vec2(20000.0, 1000.0), 8192.0), [8192, 409]);
+        // Under the side limit but too many pixels: shrunk to at most MAX_PIXELS, same shape.
+        for (w, h) in [(30000.0, 30000.0), (32768.0, 2000.0), (12345.6, 9876.5), (200000.0, 200000.0), (5792.6, 5792.6)] {
+            let [tw, th] = texture_size(vec2(w, h), 32768.0);
+            assert!(tw * th <= MAX_PIXELS, "{w}x{h} -> {tw}x{th}");
+            assert!(tw * th > MAX_PIXELS * 99 / 100, "{w}x{h} -> {tw}x{th}");
+            assert!(tw <= 32768 && th <= 32768);
+            assert!((tw as f32 / th as f32 - w / h).abs() < 0.01 * w / h, "{w}x{h} -> {tw}x{th}");
+        }
     }
 }
