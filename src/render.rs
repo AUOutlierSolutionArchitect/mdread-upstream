@@ -729,17 +729,22 @@ impl<'a> RenderCtx<'a> {
             _ => Align::Min,
         };
 
-        // Natural (unwrapped) column widths.
+        // Natural (unwrapped) column widths, and the widths of their longest words.
         let mut nat = vec![0.0f32; ncols];
+        let mut min = vec![0.0f32; ncols];
         for (ri, row) in std::iter::once(&t.head).chain(t.rows.iter()).enumerate() {
             let weight = if ri == 0 { Some(650.0) } else { None };
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
                 let (g, _, _) = self.layout_inline(ui, cell, fs, color, f32::INFINITY, Align::LEFT, weight, 1.4);
                 nat[c] = nat[c].max(g.size().x.ceil() + 2.0 * pad_x + 2.0);
+                min[c] = min[c].max(widest_word(&g).ceil() + 2.0 * pad_x + 2.0);
             }
         }
-        let widths = distribute_widths(&nat, avail, fs * 4.0);
+        for (m, &n) in min.iter_mut().zip(&nat) {
+            *m = m.max((fs * 4.0).min(n));
+        }
+        let widths = distribute_widths(&nat, &min, avail);
         let table_w: f32 = widths.iter().sum();
         let left = ui.cursor().left();
         let top = ui.cursor().top();
@@ -995,38 +1000,173 @@ fn apply_search(
     out
 }
 
-/// Shrink columns to fit `avail`, letting narrow columns keep their natural width.
-fn distribute_widths(nat: &[f32], avail: f32, min_w: f32) -> Vec<f32> {
-    let total: f32 = nat.iter().sum();
-    if total <= avail {
+/// A column whose share is at least this fraction of its natural width gets the natural
+/// width, if the others can spare it, rather than wrapping a word or two onto a new line.
+const SNAP: f32 = 0.8;
+
+/// Shrink columns to fit `avail`. Shares follow the square roots of the natural widths
+/// `nat`, which keeps the total of wrapped lines across columns lowest, so a label column
+/// next to long prose gets more room than its length alone would give it. A column that
+/// fits (or nearly fits, see `SNAP`) in its share gets its natural width, and none gets
+/// less than `min` (its longest word), so words only break when the longest ones cannot
+/// all fit.
+fn distribute_widths(nat: &[f32], min: &[f32], avail: f32) -> Vec<f32> {
+    if nat.iter().sum::<f32>() <= avail {
         return nat.to_vec();
     }
-    let n = nat.len();
-    let mut widths = nat.to_vec();
-    let mut fixed = vec![false; n];
+    let min = cap_to_fit(min, avail);
+    let mut widths = vec![0.0f32; nat.len()];
+    let mut flex: Vec<usize> = (0..nat.len()).collect();
+    let mut remaining = avail;
+    // Each round settles some columns and shares what is left among the rest.
     loop {
-        let fixed_sum: f32 = (0..n).filter(|&i| fixed[i]).map(|i| widths[i]).sum();
-        let flex: Vec<usize> = (0..n).filter(|&i| !fixed[i]).collect();
-        if flex.is_empty() {
-            break;
+        let weights: f32 = flex.iter().map(|&i| nat[i].sqrt()).sum::<f32>().max(1e-3);
+        let share = |i: usize| remaining * nat[i].sqrt() / weights;
+        let flex_min: f32 = flex.iter().map(|&i| min[i]).sum();
+        // First, shares below the minimum are raised to it.
+        let mut settled: Vec<(usize, f32)> = flex.iter().filter(|&&i| share(i) < min[i]).map(|&i| (i, min[i])).collect();
+        // Then the column that fits its share best gets its natural width, as long as the
+        // others still get their minimums.
+        if settled.is_empty() {
+            let fits = flex
+                .iter()
+                .copied()
+                .filter(|&i| nat[i] * SNAP <= share(i) && remaining - nat[i] >= flex_min - min[i])
+                .min_by(|&a, &b| (nat[a] / share(a)).total_cmp(&(nat[b] / share(b))));
+            settled.extend(fits.map(|i| (i, nat[i])));
         }
-        let remaining = (avail - fixed_sum).max(0.0);
-        let flex_nat: f32 = flex.iter().map(|&i| nat[i]).sum::<f32>().max(1.0);
-        let mut changed = false;
-        for &i in &flex {
-            let share = remaining * nat[i] / flex_nat;
-            if nat[i] <= share {
-                widths[i] = nat[i];
-                fixed[i] = true;
-                changed = true;
-            }
-        }
-        if !changed {
+        if settled.is_empty() {
             for &i in &flex {
-                widths[i] = (remaining * nat[i] / flex_nat).max(min_w.min(nat[i]));
+                widths[i] = share(i);
             }
-            break;
+            return widths;
+        }
+        for (i, w) in settled {
+            widths[i] = w;
+            remaining -= w;
+            flex.retain(|&j| j != i);
         }
     }
-    widths
+}
+
+/// Lower the largest of `min` to a common cap so they add up to at most `avail`.
+fn cap_to_fit(min: &[f32], avail: f32) -> Vec<f32> {
+    if min.iter().sum::<f32>() <= avail {
+        return min.to_vec();
+    }
+    let mut sorted = min.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut rest = avail;
+    let mut cap = 0.0;
+    for (k, &m) in sorted.iter().enumerate() {
+        let even = rest / (sorted.len() - k) as f32;
+        if m > even {
+            cap = even;
+            break;
+        }
+        rest -= m;
+    }
+    min.iter().map(|&m| m.min(cap)).collect()
+}
+
+/// Width of the widest word in a galley laid out without wrapping: how narrow it can
+/// wrap without breaking inside a word. Words end at spaces (not no-break spaces) and
+/// after hyphens, where egui also breaks lines. A word counts with the space after it:
+/// when that space does not fit, egui breaks before it and starts the next line with it.
+fn widest_word(galley: &Galley) -> f32 {
+    let mut widest = 0.0f32;
+    for row in &galley.rows {
+        let mut start: Option<f32> = None;
+        for g in &row.glyphs {
+            if g.chr.is_whitespace() && g.chr != '\u{a0}' {
+                if let Some(s) = start.take() {
+                    widest = widest.max(g.pos.x + g.advance_width - s);
+                }
+                continue;
+            }
+            let s = *start.get_or_insert(g.pos.x);
+            if g.chr == '-' {
+                widest = widest.max(g.pos.x + g.advance_width - s);
+                start = None;
+            }
+        }
+        if let (Some(s), Some(last)) = (start, row.glyphs.last()) {
+            widest = widest.max(last.pos.x + last.advance_width - s);
+        }
+    }
+    widest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tables_that_fit_keep_natural_widths() {
+        assert_eq!(distribute_widths(&[100.0, 200.0], &[50.0, 80.0], 400.0), [100.0, 200.0]);
+    }
+
+    /// To a tenth of a point.
+    fn assert_widths(actual: Vec<f32>, expected: &[f32]) {
+        assert!(actual.iter().zip(expected).all(|(a, e)| (a - e).abs() < 0.1), "{actual:?} != {expected:?}");
+    }
+
+    #[test]
+    fn columns_share_by_square_roots() {
+        assert_widths(distribute_widths(&[400.0, 1600.0], &[60.0, 60.0], 900.0), &[300.0, 600.0]);
+    }
+
+    #[test]
+    fn a_label_column_gets_room_beside_long_prose() {
+        // A "Measure | Finding" table: the labels are 270pt on one line, the findings 2500.
+        let (nat, min) = ([270.0, 2500.0], [95.0, 350.0]);
+        // In a narrow column the labels wrap, but get far more than the 65pt that
+        // sharing by length would give them.
+        assert_widths(distribute_widths(&nat, &min, 672.0), &[166.2, 505.8]);
+        // Once the labels' share nearly covers them, they stop wrapping.
+        assert_widths(distribute_widths(&nat, &min, 900.0), &[270.0, 630.0]);
+        assert_widths(distribute_widths(&nat, &min, 1200.0), &[270.0, 930.0]);
+    }
+
+    #[test]
+    fn a_nearly_fitting_column_leaves_the_others_their_longest_word() {
+        // Unwrapping the 270pt column would leave the other 690, short of its 700.
+        assert_widths(distribute_widths(&[270.0, 2500.0], &[95.0, 700.0], 960.0), &[237.5, 722.5]);
+        assert_widths(distribute_widths(&[270.0, 400.0], &[100.0, 380.0], 640.0), &[260.0, 380.0]);
+    }
+
+    #[test]
+    fn a_column_keeps_its_longest_word() {
+        // The share would be 67pt, which breaks inside a 100pt word.
+        assert_widths(distribute_widths(&[120.0, 3000.0], &[100.0, 200.0], 400.0), &[100.0, 300.0]);
+    }
+
+    #[test]
+    fn minimums_repeat_until_every_share_covers_them() {
+        // Giving column 0 its minimum leaves column 1 short of its own on the next round:
+        // 120pt on the first round (above its 119), 117.8 on the second.
+        assert_widths(distribute_widths(&[100.0, 400.0, 4900.0], &[70.0, 119.0, 100.0], 600.0), &[70.0, 119.0, 411.0]);
+    }
+
+    #[test]
+    fn words_too_long_for_the_table_are_capped_evenly() {
+        assert_eq!(cap_to_fit(&[10.0, 500.0, 600.0], 600.0), [10.0, 295.0, 295.0]);
+        assert_eq!(cap_to_fit(&[10.0, 20.0], 600.0), [10.0, 20.0]);
+        assert_widths(distribute_widths(&[100.0, 900.0, 1200.0], &[10.0, 500.0, 600.0], 600.0), &[10.0, 295.0, 295.0]);
+    }
+
+    #[test]
+    fn widest_word_ends_at_spaces_and_hyphens() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        let width = |s: &str| ctx.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), FontId::proportional(20.0), Color32::WHITE));
+        // Glyph positions are rounded to pixels.
+        let close = |a: f32, b: f32| (a - b).abs() < 1.0;
+        assert!(close(widest_word(&width("What the backend PHP is")), width("backend ").size().x));
+        assert!(close(widest_word(&width("about 4-5000000k lines")), width("5000000k ").size().x));
+        // The last word has no space after it.
+        assert!(close(widest_word(&width("a Subscriber")), width("Subscriber").size().x));
+        // No-break spaces join words, as they do when egui wraps.
+        assert!(close(widest_word(&width("made\u{a0}of it")), width("made\u{a0}of ").size().x));
+    }
 }
