@@ -31,7 +31,9 @@ USAGE:
     cat FILE.md | mdread -
 
 OPTIONS:
-    --dark, --light      Force a theme for this session (default: follow the system)
+    --dark, --light      Force a theme for this session
+    --system             Follow the system theme for this session (the default
+                         until a theme is picked in mdread)
     --find TERM          Open with the search box filled in
     --screenshot PATH    Save a PNG of the window after 1.5 s and exit
     --screenshot-delay N Delay in ms for --screenshot
@@ -262,5 +264,25 @@ mod tests {
         assert_eq!(args.files, [PathBuf::from("a.md"), PathBuf::from("b.md")]);
         assert_eq!(args.anchor, None);
         assert_eq!(parse(&["a.md#x", "b.md#y"], &both).anchor, Some("x".into()));
+    }
+
+    #[test]
+    fn help_lists_every_option() {
+        let src = include_str!("main.rs");
+        let parser = &src[src.find("fn parse_args_from").unwrap()..src.find("fn split_anchor").unwrap()];
+        // The patterns of the match arms, like `"-h" | "--help" =>`.
+        let options: Vec<&str> = parser
+            .lines()
+            .filter_map(|l| l.split_once("=>").map(|(pat, _)| pat))
+            .flat_map(|pat| pat.split('|'))
+            .filter_map(|p| p.trim().strip_prefix('"')?.strip_suffix('"'))
+            .filter(|o| o.starts_with('-') && o.len() > 1)
+            .collect();
+        assert!(options.contains(&"--screenshot-delay") && options.contains(&"-h"), "{options:?}");
+        // Whole words, so `-h` is not found inside `--help`.
+        let words: Vec<&str> = HELP.split(|c: char| c.is_whitespace() || c == ',').collect();
+        for opt in options {
+            assert!(words.contains(&opt), "{opt} is missing from HELP");
+        }
     }
 }
