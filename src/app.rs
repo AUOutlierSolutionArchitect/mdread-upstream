@@ -411,8 +411,9 @@ impl App {
                 Err(e) => app.error = Some(format!("Cannot read stdin: {e}")),
             }
         } else if let Some(p) = args.files.first() {
-            app.load_path(p.clone(), true, ctx);
-            app.pending_anchor = args.anchor.clone();
+            if app.load_path(p.clone(), true, ctx) {
+                app.pending_anchor = args.anchor.clone();
+            }
         }
         if let Some(q) = &args.find {
             app.search.open = true;
@@ -456,13 +457,14 @@ impl App {
         }
     }
 
-    fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) {
-        self.load_path_in(path, push_history, None, ctx);
+    /// Returns whether the file was read; on failure the error screen shows instead.
+    fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) -> bool {
+        self.load_path_in(path, push_history, None, ctx)
     }
 
     /// Open `path` with the files sidebar showing `files_dir`, or a folder chosen by
-    /// `files::sidebar_root` when that is `None`.
-    fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) {
+    /// `files::sidebar_root` when that is `None`. Returns whether the file was read.
+    fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) -> bool {
         // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
         // drives cannot be canonicalized; an absolute path still gives the folder links
         // and the sidebar start from.
@@ -491,12 +493,16 @@ impl App {
                 let home = fonts::home_dir();
                 let dir = files_dir.or_else(|| files::sidebar_root(self.files_dir.as_deref(), &path, home.as_deref()));
                 self.set_files_dir(dir, ctx);
+                true
             }
             Err(e) => {
                 self.error = Some(format!("Cannot read {}: {e}", links::display_path(&path)));
                 self.doc = None;
                 self.path = Some(path);
                 ctx.send_viewport_cmd(ViewportCommand::Title("mdread".into()));
+                // An anchor waiting for this document has nothing to jump in.
+                self.pending_anchor = None;
+                false
             }
         }
     }
@@ -776,8 +782,9 @@ impl App {
             for name in FOLDER_INDEX {
                 let p = abs.join(name);
                 if p.is_file() {
-                    self.load_path(p, true, ctx);
-                    self.pending_anchor = frag;
+                    if self.load_path(p, true, ctx) {
+                        self.pending_anchor = frag;
+                    }
                     return;
                 }
             }
@@ -786,8 +793,9 @@ impl App {
         }
         if abs.is_file() {
             if files::is_markdown(&abs) || abs.extension().is_none() {
-                self.load_path(abs, true, ctx);
-                self.pending_anchor = frag;
+                if self.load_path(abs, true, ctx) {
+                    self.pending_anchor = frag;
+                }
             } else if links::opens_in_default_app(&abs) {
                 self.set_status(format!("Opened {}", links::display_path(&abs)));
                 self.launch(abs, false, ctx);
@@ -2489,6 +2497,25 @@ mod tests {
         for name in ["notes.md~", "~$report.docx", ".~lock.x#", "README~1.MARKDOWN", "LONGNAME~1.MD", "a~b.md", "x~1.tar.gz"] {
             assert!(!is_short_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_failed_first_load_drops_its_anchor() {
+        // `mdread folder.md#x`: the path exists, so `#x` is split off, but it cannot be read.
+        // The anchor belonged to that file; the next document opened must not jump to x.
+        let dir = std::env::temp_dir().join(format!("mdread-anchor-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder.md")).unwrap();
+        let next = dir.join("next.md");
+        std::fs::write(&next, "# Top\n\n## x\n").unwrap();
+        let ctx = Context::default();
+        let args = Args { files: vec![dir.join("folder.md")], anchor: Some("x".into()), ..Args::default() };
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), args);
+        assert!(app.error.is_some(), "the folder should fail to load");
+        app.load_path(next, true, &ctx);
+        assert!(app.doc.is_some());
+        assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

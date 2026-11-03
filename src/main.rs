@@ -18,7 +18,7 @@ mod theme;
 #[cfg(windows)]
 mod win;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use app::{Args, ThemeChoice};
@@ -31,7 +31,9 @@ USAGE:
     cat FILE.md | mdread -
 
 OPTIONS:
-    --dark, --light      Force a theme for this session (default: follow the system)
+    --dark, --light      Force a theme for this session
+    --system             Follow the system theme for this session (the default
+                         until a theme is picked in mdread)
     --find TERM          Open with the search box filled in
     --screenshot PATH    Save a PNG of the window after 1.5 s and exit
     --screenshot-delay N Delay in ms for --screenshot
@@ -72,8 +74,13 @@ fn exit_with(text: &str, code: i32) -> ! {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args_os().skip(1), |p| p.exists())
+}
+
+/// `parse_args` over a given argument list, with `exists` standing in for the file system.
+fn parse_args_from(argv: impl IntoIterator<Item = OsString>, exists: impl Fn(&Path) -> bool) -> Args {
     let mut args = Args { screenshot_delay_ms: 1500, ..Args::default() };
-    let mut it = std::env::args_os().skip(1);
+    let mut it = argv.into_iter();
     while let Some(a) = it.next() {
         let s = a.to_string_lossy();
         match s.as_ref() {
@@ -90,11 +97,12 @@ fn parse_args() -> Args {
             "-" => args.stdin = true,
             _ if s.starts_with("--") => exit_with(&format!("unknown option {s}\n{HELP}\n"), 2),
             _ => {
-                let (file, anchor) = split_anchor(&a, |p| p.exists());
-                args.files.push(file);
-                if anchor.is_some() {
+                let (file, anchor) = split_anchor(&a, &exists);
+                // Only the first file is opened, so only its anchor means anything.
+                if args.files.is_empty() {
                     args.anchor = anchor;
                 }
+                args.files.push(file);
             }
         }
     }
@@ -241,5 +249,40 @@ mod tests {
     fn missing_files_are_passed_through_unchanged() {
         assert_eq!(split("missing.md#top", &[]), (PathBuf::from("missing.md#top"), None));
         assert_eq!(split("plain.md", &[]), (PathBuf::from("plain.md"), None));
+    }
+
+    fn parse(argv: &[&str], existing: &[&str]) -> Args {
+        parse_args_from(argv.iter().map(OsString::from), |p| existing.iter().any(|e| Path::new(e) == p))
+    }
+
+    #[test]
+    fn only_the_first_files_anchor_is_used() {
+        // Only the first file is opened, so an anchor on a later one points into a page
+        // that is not shown.
+        let both = ["a.md", "b.md"];
+        let args = parse(&["a.md", "b.md#x"], &both);
+        assert_eq!(args.files, [PathBuf::from("a.md"), PathBuf::from("b.md")]);
+        assert_eq!(args.anchor, None);
+        assert_eq!(parse(&["a.md#x", "b.md#y"], &both).anchor, Some("x".into()));
+    }
+
+    #[test]
+    fn help_lists_every_option() {
+        let src = include_str!("main.rs");
+        let parser = &src[src.find("fn parse_args_from").unwrap()..src.find("fn split_anchor").unwrap()];
+        // The patterns of the match arms, like `"-h" | "--help" =>`.
+        let options: Vec<&str> = parser
+            .lines()
+            .filter_map(|l| l.split_once("=>").map(|(pat, _)| pat))
+            .flat_map(|pat| pat.split('|'))
+            .filter_map(|p| p.trim().strip_prefix('"')?.strip_suffix('"'))
+            .filter(|o| o.starts_with('-') && o.len() > 1)
+            .collect();
+        assert!(options.contains(&"--screenshot-delay") && options.contains(&"-h"), "{options:?}");
+        // Whole words, so `-h` is not found inside `--help`.
+        let words: Vec<&str> = HELP.split(|c: char| c.is_whitespace() || c == ',').collect();
+        for opt in options {
+            assert!(words.contains(&opt), "{opt} is missing from HELP");
+        }
     }
 }
