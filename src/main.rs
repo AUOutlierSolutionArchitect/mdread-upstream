@@ -18,7 +18,7 @@ mod theme;
 #[cfg(windows)]
 mod win;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use app::{Args, ThemeChoice};
@@ -72,8 +72,13 @@ fn exit_with(text: &str, code: i32) -> ! {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args_os().skip(1), |p| p.exists())
+}
+
+/// `parse_args` over a given argument list, with `exists` standing in for the file system.
+fn parse_args_from(argv: impl IntoIterator<Item = OsString>, exists: impl Fn(&Path) -> bool) -> Args {
     let mut args = Args { screenshot_delay_ms: 1500, ..Args::default() };
-    let mut it = std::env::args_os().skip(1);
+    let mut it = argv.into_iter();
     while let Some(a) = it.next() {
         let s = a.to_string_lossy();
         match s.as_ref() {
@@ -90,11 +95,12 @@ fn parse_args() -> Args {
             "-" => args.stdin = true,
             _ if s.starts_with("--") => exit_with(&format!("unknown option {s}\n{HELP}\n"), 2),
             _ => {
-                let (file, anchor) = split_anchor(&a, |p| p.exists());
-                args.files.push(file);
-                if anchor.is_some() {
+                let (file, anchor) = split_anchor(&a, &exists);
+                // Only the first file is opened, so only its anchor means anything.
+                if args.files.is_empty() {
                     args.anchor = anchor;
                 }
+                args.files.push(file);
             }
         }
     }
@@ -241,5 +247,20 @@ mod tests {
     fn missing_files_are_passed_through_unchanged() {
         assert_eq!(split("missing.md#top", &[]), (PathBuf::from("missing.md#top"), None));
         assert_eq!(split("plain.md", &[]), (PathBuf::from("plain.md"), None));
+    }
+
+    fn parse(argv: &[&str], existing: &[&str]) -> Args {
+        parse_args_from(argv.iter().map(OsString::from), |p| existing.iter().any(|e| Path::new(e) == p))
+    }
+
+    #[test]
+    fn only_the_first_files_anchor_is_used() {
+        // Only the first file is opened, so an anchor on a later one points into a page
+        // that is not shown.
+        let both = ["a.md", "b.md"];
+        let args = parse(&["a.md", "b.md#x"], &both);
+        assert_eq!(args.files, [PathBuf::from("a.md"), PathBuf::from("b.md")]);
+        assert_eq!(args.anchor, None);
+        assert_eq!(parse(&["a.md#x", "b.md#y"], &both).anchor, Some("x".into()));
     }
 }
