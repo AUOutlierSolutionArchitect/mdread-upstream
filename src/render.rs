@@ -62,6 +62,19 @@ type LinkRanges = Vec<(Range<usize>, u32)>;
 /// Backgrounds of inline code and search matches, relative to their galley.
 type Backgrounds = Vec<(Rect, Color32)>;
 
+/// Background of one character of a layout job: colour, margin, and how far its glyph is
+/// drawn below where egui lays it out (negative: above).
+#[derive(Clone, Copy, PartialEq)]
+struct Fill {
+    color: Color32,
+    expand: f32,
+    dy: f32,
+}
+
+impl Fill {
+    const NONE: Fill = Fill { color: Color32::TRANSPARENT, expand: 0.0, dy: 0.0 };
+}
+
 impl<'a> RenderCtx<'a> {
     pub fn new(
         pal: &'a Palette,
@@ -221,10 +234,17 @@ impl<'a> RenderCtx<'a> {
         // egui draws a text background from the top of the text down by the whole line
         // height, which leaves it half a line low now that it centres text in that height,
         // so the backgrounds are taken out of the job and drawn around the text instead.
+        // Inline code may be drawn lower or higher than egui lays it out (fonts.rs, Windows
+        // only), and its background goes with it.
         let mut fills = Vec::new();
         if job.sections.iter().any(|s| s.format.background != Color32::TRANSPARENT) {
             for s in &mut job.sections {
-                let fill = (std::mem::replace(&mut s.format.background, Color32::TRANSPARENT), s.format.expand_bg);
+                let dy = if self.fonts.inline_code_shift != 0.0 && s.format.font_id.family == self.fonts.inline_mono {
+                    (s.format.font_id.size * self.fonts.inline_code_shift).round_ui()
+                } else {
+                    0.0
+                };
+                let fill = Fill { color: std::mem::replace(&mut s.format.background, Color32::TRANSPARENT), expand: s.format.expand_bg, dy };
                 fills.extend(std::iter::repeat_n(fill, job.text[s.byte_range.start.0..s.byte_range.end.0].chars().count()));
             }
         }
@@ -858,9 +878,9 @@ impl<'a> RenderCtx<'a> {
 // helpers
 // ----------------------------------------------------------------------
 
-/// One rect per run of glyphs with the same fill (colour and margin, one per character of
-/// the job), as tall as the font around the text.
-fn text_backgrounds(galley: &Galley, fills: &[(Color32, f32)]) -> Backgrounds {
+/// One rect per run of glyphs with the same fill (one per character of the job), as tall
+/// as the font around the text and moved with the glyphs.
+fn text_backgrounds(galley: &Galley, fills: &[Fill]) -> Backgrounds {
     let mut out = Vec::new();
     if fills.is_empty() {
         return out;
@@ -868,21 +888,21 @@ fn text_backgrounds(galley: &Galley, fills: &[(Color32, f32)]) -> Backgrounds {
     // egui lays out one glyph per character, so the n-th glyph is the n-th character.
     let mut first_char = 0;
     for placed in &galley.rows {
-        let mut run: Option<(Rect, Color32, f32)> = None;
+        let mut run: Option<(Rect, Fill)> = None;
         for (i, g) in placed.row.glyphs.iter().enumerate() {
-            let (color, expand) = fills.get(first_char + i).copied().unwrap_or((Color32::TRANSPARENT, 0.0));
-            let rect = Rect::from_min_size(placed.pos + vec2(g.pos.x, g.pos.y - g.font_ascent), vec2(g.advance_width, g.font_height));
+            let fill = fills.get(first_char + i).copied().unwrap_or(Fill::NONE);
+            let rect = Rect::from_min_size(placed.pos + vec2(g.pos.x, g.pos.y - g.font_ascent + fill.dy), vec2(g.advance_width, g.font_height));
             match &mut run {
-                Some((r, c, e)) if *c == color && *e == expand && r.y_range() == rect.y_range() => r.max.x = rect.max.x,
+                Some((r, f)) if *f == fill && r.y_range() == rect.y_range() => r.max.x = rect.max.x,
                 _ => {
-                    out.extend(run.take().map(|(r, c, e)| (r.expand(e), c)));
-                    if color != Color32::TRANSPARENT {
-                        run = Some((rect, color, expand));
+                    out.extend(run.take().map(|(r, f)| (r.expand(f.expand), f.color)));
+                    if fill.color != Color32::TRANSPARENT {
+                        run = Some((rect, fill));
                     }
                 }
             }
         }
-        out.extend(run.map(|(r, c, e)| (r.expand(e), c)));
+        out.extend(run.map(|(r, f)| (r.expand(f.expand), f.color)));
         first_char += placed.char_count_including_newline().0;
     }
     out

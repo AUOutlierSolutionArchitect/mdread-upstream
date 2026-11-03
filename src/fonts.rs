@@ -32,6 +32,10 @@ pub struct FontSet {
     /// Code face for inline code, shifted onto the body text's baseline where needed;
     /// otherwise `mono`.
     pub inline_mono: FontFamily,
+    /// How far `inline_mono` draws its glyphs below where egui lays them out (negative:
+    /// above), as a fraction of the code font size; 0 when it is `mono`. Backgrounds
+    /// drawn around inline code move by the same amount.
+    pub inline_code_shift: f32,
     /// True when `sans` is a variable font with a `wght` axis, so bold is done with coords.
     pub variable_weight: bool,
     /// Range of the body font's `wght` axis (only meaningful with `variable_weight`).
@@ -320,14 +324,24 @@ fn wght_axis(data: &FontData) -> Option<(f32, f32)> {
         .map(|a| (a.range.min.min(a.range.max), a.range.min.max(a.range.max)))
 }
 
-/// A face's ascent as a fraction of its em, chosen the way skrifa (and so epaint) does:
-/// OS/2 sTypoAscender when USE_TYPO_METRICS is set, else hhea's ascender, else (when the
-/// hhea metrics are zero) the OS/2 typo or Windows ascent. Read straight from the sfnt
-/// tables, using the first face of a collection.
+/// A face's line metrics, as fractions of its em. `descent` is negative below the baseline.
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(not(windows), allow(dead_code))]
-fn ascent_em(font: &[u8]) -> Option<f32> {
+struct LineMetrics {
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+}
+
+/// A face's line metrics, chosen the way skrifa (and so epaint) does: the OS/2 typo
+/// metrics when USE_TYPO_METRICS is set, else hhea's, else (when hhea's ascender and
+/// descender are zero) the OS/2 typo metrics, else the Windows ascent and descent with
+/// hhea's line gap. Read straight from the sfnt tables, using the first face of a
+/// collection.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn line_metrics_em(font: &[u8]) -> Option<LineMetrics> {
     let u16_at = |o: usize| Some(u16::from_be_bytes(font.get(o..o + 2)?.try_into().ok()?));
-    let i16_at = |o: usize| u16_at(o).map(|v| v as i16);
+    let i16_at = |o: usize| u16_at(o).map(|v| v as i16 as i32);
     let u32_at = |o: usize| Some(u32::from_be_bytes(font.get(o..o + 4)?.try_into().ok()?));
     let base = if font.get(..4)? == b"ttcf" { u32_at(12)? as usize } else { 0 };
     let tables = u16_at(base + 4)? as usize;
@@ -338,28 +352,39 @@ fn ascent_em(font: &[u8]) -> Option<f32> {
     let upem = u16_at(table(b"head")? + 18)?;
     let os2 = table(b"OS/2");
     let use_typo = os2.and_then(|o| u16_at(o + 62)).is_some_and(|fs_selection| fs_selection & 0x80 != 0);
-    let typo = os2.and_then(|o| Some((i16_at(o + 68)?, i16_at(o + 70)?)));
-    let ascent = match (use_typo, typo) {
-        (true, Some((asc, _))) => asc,
-        _ => match table(b"hhea").and_then(|o| Some((i16_at(o + 4)?, i16_at(o + 6)?))) {
-            Some((asc, desc)) if asc != 0 || desc != 0 => asc,
-            _ => match typo {
-                Some((asc, desc)) if asc != 0 || desc != 0 => asc,
-                _ => u16_at(os2? + 74)? as i16,
-            },
-        },
+    let typo = os2.and_then(|o| Some((i16_at(o + 68)?, i16_at(o + 70)?, i16_at(o + 72)?)));
+    let (ascent, descent, line_gap) = match (use_typo, typo) {
+        (true, Some(typo)) => typo,
+        _ => {
+            let hhea = table(b"hhea").and_then(|o| Some((i16_at(o + 4)?, i16_at(o + 6)?, i16_at(o + 8)?)));
+            match (hhea, typo) {
+                (Some(hhea @ (asc, desc, _)), _) if asc != 0 || desc != 0 => hhea,
+                (_, Some(typo @ (asc, desc, _))) if asc != 0 || desc != 0 => typo,
+                // Windows descent is positive below the baseline; the others are negative.
+                (hhea, _) => (u16_at(os2? + 74)? as i32, -(u16_at(os2? + 76)? as i32), hhea.map_or(0, |h| h.2)),
+            }
+        }
     };
-    (upem > 0).then(|| ascent as f32 / upem as f32)
+    let em = |v: i32| v as f32 / upem as f32;
+    (upem > 0).then(|| LineMetrics { ascent: em(ascent), descent: em(descent), line_gap: em(line_gap) })
 }
 
 /// Downward shift, as a fraction of the code font size, that puts inline code on the
-/// body text's baseline. epaint puts each face's baseline its own ascent below the top
-/// of the row, so a body font with a taller ascent than the (smaller) code font leaves
-/// code sitting visibly above the line. Ascents are fractions of the em.
+/// body text's baseline (negative: upward). epaint centres each face's row (ascent −
+/// descent + line gap) in the line height the text asks for, so a face's baseline sits
+/// (ascent + descent − line gap) / 2 below the middle of the line. Segoe UI Variable's
+/// baseline sits lower than that of any (smaller) code font, which leaves code visibly
+/// above the line. `None` when the baselines already agree.
+///
+/// Superscript and subscript text has no line height of its own (render.rs aligns it to
+/// the top or bottom of the row instead), so code inside it is not centred and ends up
+/// about 0.17 em of its size too high or too low. That needs `` ^`x`^ `` and is rare
+/// enough not to justify two more shifted copies of the code font.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn code_baseline_shift(sans_ascent: f32, mono_ascent: f32) -> Option<f32> {
-    let delta = sans_ascent - CODE_SCALE * mono_ascent;
-    (delta > 0.0).then(|| delta / CODE_SCALE)
+fn code_baseline_shift(sans: LineMetrics, mono: LineMetrics) -> Option<f32> {
+    let below_middle = |m: LineMetrics| (m.ascent + m.descent - m.line_gap) / 2.0;
+    let delta = below_middle(sans) - CODE_SCALE * below_middle(mono);
+    (delta.abs() > 1e-3).then(|| delta / CODE_SCALE)
 }
 
 /// First Nerd Font monospace face found, as (display name, bytes). Only the top level of
@@ -441,7 +466,7 @@ pub fn install(ctx: &Context) -> FontSet {
     let sans;
     let sans_italic;
     #[cfg(windows)]
-    let sans_ascent = regular.as_deref().and_then(ascent_em);
+    let sans_metrics = regular.as_deref().and_then(line_metrics_em);
     if let Some(bytes) = regular {
         let data = FontData::from_owned(bytes);
         if let Some(range) = wght_axis(&data) {
@@ -534,12 +559,14 @@ pub fn install(ctx: &Context) -> FontSet {
     }
     #[allow(unused_mut)]
     let mut inline_mono = FontFamily::Monospace;
+    #[allow(unused_mut)]
+    let mut inline_code_shift = 0.0;
     if let Some(bytes) = mono_bytes {
-        // Segoe UI Variable's ascent is much taller than any code font's. Only inline code
-        // sits on the body text's baseline, so it gets a shifted copy of the face; code
-        // blocks and the rest of the monospace text keep the plain one.
+        // Segoe UI Variable's baseline sits much lower in its row than any code font's.
+        // Only inline code sits on the body text's baseline, so it gets a shifted copy of
+        // the face; code blocks and the rest of the monospace text keep the plain one.
         #[cfg(windows)]
-        if let Some(shift) = sans_ascent.zip(ascent_em(&bytes)).and_then(|(s, m)| code_baseline_shift(s, m)) {
+        if let Some(shift) = sans_metrics.zip(line_metrics_em(&bytes)).and_then(|(s, m)| code_baseline_shift(s, m)) {
             log::debug!("fonts: shifting inline code down by {shift:.3} em to the body baseline");
             let mut data = FontData::from_owned(bytes.clone());
             data.tweak.y_offset_factor = shift;
@@ -547,6 +574,7 @@ pub fn install(ctx: &Context) -> FontSet {
             let mut list = vec!["mdread-mono-inline".to_owned()];
             list.extend(defs.families.get(&FontFamily::Monospace).into_iter().flatten().cloned());
             inline_mono = family(&mut defs, "mdread-mono-inline", list);
+            inline_code_shift = shift;
         }
         defs.font_data.insert("mdread-mono".to_owned(), Arc::new(FontData::from_owned(bytes)));
         let mono = defs.families.entry(FontFamily::Monospace).or_default();
@@ -567,6 +595,7 @@ pub fn install(ctx: &Context) -> FontSet {
         sans_bold_italic,
         mono: FontFamily::Monospace,
         inline_mono,
+        inline_code_shift,
         variable_weight: variable,
         wght_range,
         sans_name,
@@ -804,8 +833,11 @@ mod tests {
     }
 
     #[test]
-    fn ascent_from_sfnt_tables() {
-        // A minimal sfnt: table directory with head, hhea and OS/2.
+    fn line_metrics_from_sfnt_tables() {
+        // A minimal sfnt: table directory with head, hhea and OS/2, 2048 units per em.
+        // hhea's descent is -512 (0 when its ascent is 0) and its gap always 205; typo's
+        // descent and gap are -409 and 102 (0 when its ascent is 0); Windows' ascent and
+        // descent are 1024 and 256.
         fn font(hhea_asc: i16, typo_asc: i16, use_typo: bool, ttc: bool) -> Vec<u8> {
             let base = if ttc { 16 } else { 0 };
             let dir = base + 12 + 3 * 16;
@@ -822,37 +854,67 @@ mod tests {
                 f[rec + 8..rec + 12].copy_from_slice(&(off as u32).to_be_bytes());
             }
             f[head + 18..head + 20].copy_from_slice(&2048u16.to_be_bytes());
-            f[hhea + 4..hhea + 6].copy_from_slice(&hhea_asc.to_be_bytes());
+            if hhea_asc != 0 {
+                f[hhea + 4..hhea + 6].copy_from_slice(&hhea_asc.to_be_bytes());
+                f[hhea + 6..hhea + 8].copy_from_slice(&(-512i16).to_be_bytes());
+            }
+            f[hhea + 8..hhea + 10].copy_from_slice(&205i16.to_be_bytes());
             f[os2 + 62..os2 + 64].copy_from_slice(&(if use_typo { 0x80u16 } else { 0 }).to_be_bytes());
             f[os2 + 68..os2 + 70].copy_from_slice(&typo_asc.to_be_bytes());
+            if typo_asc != 0 {
+                f[os2 + 70..os2 + 72].copy_from_slice(&(-409i16).to_be_bytes());
+                f[os2 + 72..os2 + 74].copy_from_slice(&102i16.to_be_bytes());
+            }
             f[os2 + 74..os2 + 76].copy_from_slice(&1024u16.to_be_bytes());
+            f[os2 + 76..os2 + 78].copy_from_slice(&256u16.to_be_bytes());
             f
         }
-        assert_eq!(ascent_em(&font(2048, 1536, false, false)), Some(1.0));
-        assert_eq!(ascent_em(&font(2048, 1536, true, false)), Some(0.75));
-        assert_eq!(ascent_em(&font(2048, 1536, false, true)), Some(1.0));
-        // hhea all zero: typo metrics, then the Windows ascent.
-        assert_eq!(ascent_em(&font(0, 1536, false, false)), Some(0.75));
-        assert_eq!(ascent_em(&font(0, 0, false, false)), Some(0.5));
-        assert_eq!(ascent_em(b"not a font"), None);
-        assert_eq!(ascent_em(&[]), None);
+        let m = |a: i16, d: i16, g: i16| Some(LineMetrics { ascent: a as f32 / 2048.0, descent: d as f32 / 2048.0, line_gap: g as f32 / 2048.0 });
+        assert_eq!(line_metrics_em(&font(2048, 1536, false, false)), m(2048, -512, 205));
+        assert_eq!(line_metrics_em(&font(2048, 1536, true, false)), m(1536, -409, 102));
+        assert_eq!(line_metrics_em(&font(2048, 1536, false, true)), m(2048, -512, 205));
+        // hhea ascent and descent zero: typo metrics, then the Windows ones with hhea's gap.
+        assert_eq!(line_metrics_em(&font(0, 1536, false, false)), m(1536, -409, 102));
+        assert_eq!(line_metrics_em(&font(0, 0, false, false)), m(1024, -256, 205));
+        assert_eq!(line_metrics_em(b"not a font"), None);
+        assert_eq!(line_metrics_em(&[]), None);
+    }
+
+    /// Where epaint puts a face's baseline in a line of the given height: it centres the
+    /// face's row in the line (egui 0.37 text_layout.rs `galley_from_rows`).
+    fn epaint_baseline(m: LineMetrics, size: f32, line_height: f32) -> f32 {
+        size * m.ascent + 0.5 * (line_height - size * (m.ascent - m.descent + m.line_gap))
     }
 
     #[test]
     fn code_shift_puts_code_on_the_body_baseline() {
-        let shift = code_baseline_shift(1.08, 0.93).unwrap();
-        // Shift (scaled by the code size) closes the gap between the two baselines.
-        assert!((CODE_SCALE * 0.93 + CODE_SCALE * shift - 1.08).abs() < 1e-6);
-        assert_eq!(code_baseline_shift(0.8, 1.0), None);
+        // Segoe UI Variable and Cascadia Mono, as on Windows 11.
+        let sans = LineMetrics { ascent: 1.079, descent: -0.251, line_gap: 0.0 };
+        let mono = LineMetrics { ascent: 0.928, descent: -0.234, line_gap: 0.0 };
+        let shift = code_baseline_shift(sans, mono).unwrap();
+        assert!(shift > 0.0);
+        for (size, lh) in [(16.0, 1.6), (24.0, 1.3), (13.0, 1.0)] {
+            let code_size = CODE_SCALE * size;
+            let body = epaint_baseline(sans, size, size * lh);
+            let code = epaint_baseline(mono, code_size, size * lh) + shift * code_size;
+            assert!((body - code).abs() < 1e-4, "{size} {lh}: {body} vs {code}");
+        }
+        // Code whose baseline already matches is left alone; one that sits low moves up.
+        let same = LineMetrics { ascent: sans.ascent / CODE_SCALE, descent: sans.descent / CODE_SCALE, line_gap: 0.0 };
+        assert_eq!(code_baseline_shift(sans, same), None);
+        assert!(code_baseline_shift(mono, sans).unwrap() < 0.0);
     }
 
     #[cfg(windows)]
     #[test]
-    fn ascent_of_installed_fonts() {
-        for file in ["SegUIVar.ttf", "consola.ttf", "YuGothM.ttc"] {
+    fn line_metrics_of_installed_fonts() {
+        for file in ["SegUIVar.ttf", "consola.ttf", "CascadiaMono.ttf", "YuGothM.ttc"] {
             if let Some(bytes) = read(file) {
-                let asc = ascent_em(&bytes).unwrap();
-                assert!((0.6..1.3).contains(&asc), "{file}: {asc}");
+                let m = line_metrics_em(&bytes).unwrap();
+                assert!((0.6..1.3).contains(&m.ascent), "{file}: {m:?}");
+                assert!((-0.6..0.0).contains(&m.descent), "{file}: {m:?}");
+                // Yu Gothic's is 0.5.
+                assert!((0.0..1.0).contains(&m.line_gap), "{file}: {m:?}");
             }
         }
     }
