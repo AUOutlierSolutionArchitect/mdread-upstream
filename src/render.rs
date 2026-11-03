@@ -76,6 +76,7 @@ impl Fill {
 }
 
 impl<'a> RenderCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pal: &'a Palette,
         fonts: &'a FontSet,
@@ -753,14 +754,14 @@ impl<'a> RenderCtx<'a> {
             }
             let mut galleys = Vec::with_capacity(ncols);
             let mut row_h = 0.0f32;
-            for c in 0..ncols {
+            for (c, &width) in widths.iter().enumerate() {
                 let cell = row.get(c).unwrap_or(&empty);
                 let (g, links, backgrounds) = self.layout_inline(
                     ui,
                     cell,
                     fs,
                     color,
-                    (widths[c] - 2.0 * pad_x).max(8.0),
+                    (width - 2.0 * pad_x).max(8.0),
                     Align::LEFT,
                     if is_head { Some(650.0) } else { None },
                     1.4,

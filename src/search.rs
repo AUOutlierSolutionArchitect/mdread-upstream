@@ -105,12 +105,7 @@ pub fn find_ci(hay: &str, needle_lower: &str) -> Vec<Range<usize>> {
             let start = map[s];
             let end_lower = s + m.len();
             // end maps to the start of the next original char
-            let end = if end_lower >= map.len() - 1 {
-                hay.len()
-            } else {
-                let orig_end_char = map[end_lower];
-                orig_end_char
-            };
+            let end = if end_lower >= map.len() - 1 { hay.len() } else { map[end_lower] };
             start..end
         })
         .collect()
