@@ -205,6 +205,8 @@ pub struct App {
     scroll_offset: f32,
     viewport_h: f32,
     content_h: f32,
+    /// The document generation `content_h` was measured for.
+    content_gen: u64,
     pending_offset: Option<f32>,
     scroll_delta: f32,
     jump: Option<(usize, u8)>,
@@ -349,6 +351,7 @@ impl App {
             scroll_offset: 0.0,
             viewport_h: 800.0,
             content_h: 0.0,
+            content_gen: 0,
             pending_offset: None,
             scroll_delta: 0.0,
             jump: None,
@@ -1741,7 +1744,14 @@ impl App {
             .auto_shrink([false, false])
             .scroll_source(ScrollSource { scroll_bar: true, drag: DragScroll::OnTouch, mouse_wheel: true });
         if let Some(off) = self.pending_offset.take() {
-            sa = sa.vertical_scroll_offset(off.min(self.content_h.max(0.0)));
+            let measured = self.content_gen == self.gen;
+            match scroll_target(off, self.content_h, measured) {
+                Some(y) => sa = set_scroll(ui, sa, y, measured),
+                None => {
+                    self.pending_offset = Some(off);
+                    ctx.request_repaint();
+                }
+            }
         }
 
         let scroll_delta = std::mem::take(&mut self.scroll_delta);
@@ -1831,6 +1841,7 @@ impl App {
         self.scroll_offset = out.state.clamped_offset().y;
         self.viewport_h = out.inner_rect.height();
         self.content_h = out.content_size.y;
+        self.content_gen = self.gen;
 
         if let Some((b, left)) = self.jump {
             if self.diagrams.laying_out() && Instant::now() < self.jump_until {
@@ -2261,6 +2272,39 @@ fn is_short_name(name: &str) -> bool {
     !head.is_empty() && stem.len() <= 8 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.len() <= 3 && !ext.contains('.')
 }
 
+/// The offset to give the content scroll area for a requested one. `content_h` is the
+/// content height from the last frame, and `measured_this_doc` says whether that frame showed
+/// the document now loaded.
+///
+/// The clamp keeps End's `f32::MAX` out of the layout. It only applies to the page it was
+/// measured on: on the frame after a document change, `content_h` is the previous
+/// document's, and clamping Back's saved offset to it would land a long page near the top.
+/// Other offsets go through as they are, and the scroll area clamps them to the new document
+/// at the end of the frame. End before the new page has been measured (a reload or the Open
+/// dialog can change the document earlier in the same frame) gets `None`: try next frame.
+fn scroll_target(requested: f32, content_h: f32, measured_this_doc: bool) -> Option<f32> {
+    if measured_this_doc {
+        Some(requested.min(content_h.max(0.0)))
+    } else if requested == f32::MAX {
+        None
+    } else {
+        Some(requested)
+    }
+}
+
+/// Puts the content scroll area at `y` this frame (`measured_this_doc` as for `scroll_target`).
+///
+/// On the first frame of a new document the scroll area still has the previous one's bounds.
+/// With rubber-banding on, an offset past them springs back and then coasts on upward, so
+/// Back to a page left further down than the previous page is tall lands far too high. Off
+/// for this frame, the offset stays put and the scroll area clamps it to the new content.
+fn set_scroll(ui: &mut Ui, sa: ScrollArea, y: f32, measured_this_doc: bool) -> ScrollArea {
+    if !measured_this_doc {
+        ui.spacing_mut().scroll.kinetic.rubber_band = false;
+    }
+    sa.vertical_scroll_offset(y)
+}
+
 /// Read errors a save in progress causes on Windows: the file is locked (sharing or lock
 /// violation), delete-pending (access denied) or briefly gone while an editor replaces it.
 fn is_transient_read_error(e: &std::io::Error) -> bool {
@@ -2327,6 +2371,58 @@ mod tests {
         assert_eq!(key(none, Key::F3), [Cmd::Next]);
         // Both in one frame: each goes to its own binding.
         assert_eq!(keys(&[(shift, Key::N), (none, Key::N)], false), [Cmd::Prev, Cmd::Next]);
+    }
+
+    #[test]
+    fn back_to_a_longer_page_restores_its_scroll_position() {
+        // Back from a 1,900 px page to one left 9,000 px down: the last frame measured the
+        // short page, so its height says nothing about where the long one can scroll.
+        assert_eq!(scroll_target(9000.0, 1900.0, false), Some(9000.0));
+        // End on the page shown: as far as that page goes.
+        assert_eq!(scroll_target(f32::MAX, 1900.0, true), Some(1900.0));
+        assert_eq!(scroll_target(500.0, 1900.0, true), Some(500.0));
+    }
+
+    /// Runs `frames` headless egui frames of a page `h` tall in a 600 px window, first putting
+    /// it at `restore` (offset, measured_this_doc) if given. Returns where it ends up.
+    fn scroll_frames(ctx: &Context, time: &mut f64, h: f32, mut restore: Option<(f32, bool)>, frames: usize) -> f32 {
+        let mut y = 0.0;
+        for _ in 0..frames {
+            *time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                time: Some(*time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut sa = ScrollArea::vertical().id_salt("content").auto_shrink([false, false]);
+                if let Some((off, measured)) = restore.take() {
+                    sa = set_scroll(ui, sa, off, measured);
+                }
+                y = sa.show(ui, |ui| ui.allocate_space(vec2(100.0, h))).state.clamped_offset().y;
+            });
+            out.textures_delta.clear();
+        }
+        y
+    }
+
+    #[test]
+    fn back_lands_where_it_left_even_from_a_scrollable_page() {
+        // On the first frame the scroll area still has the previous page's bounds; with
+        // rubber-banding it would spring the restored offset back and then coast up.
+        let ctx = Context::default();
+        let mut time = 0.0;
+        scroll_frames(&ctx, &mut time, 2000.0, None, 3);
+        let y = scroll_frames(&ctx, &mut time, 20000.0, Some((9000.0, false)), 90);
+        assert!((y - 9000.0).abs() < 1.0, "landed at {y}, not 9000");
+    }
+
+    #[test]
+    fn end_waits_for_a_new_page_to_be_measured() {
+        // End in the frame a reload or the Open dialog changed the document: f32::MAX must
+        // not reach the layout, so it waits a frame for the new page's height.
+        assert_eq!(scroll_target(f32::MAX, 1900.0, false), None);
     }
 
     #[test]
