@@ -563,8 +563,7 @@ impl<'a> RenderCtx<'a> {
         let scale = (room.span() / d.size.x).clamp(natural * 0.4, natural);
         let size = (d.size * scale * ppp).round() / ppp;
         let max_side = ui.ctx().input(|i| i.max_texture_side) as f32;
-        let px = size * ppp * (max_side / (size.max_elem() * ppp)).min(1.0);
-        let px = [px.x.round().max(1.0) as usize, px.y.round().max(1.0) as usize];
+        let px = mermaid::texture_size(size * ppp, max_side);
 
         let (row, _) = ui.allocate_exact_size(vec2(column.span(), size.y), Sense::hover());
         let width = size.x.min(room.span());
