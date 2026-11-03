@@ -106,6 +106,9 @@ const FONT_DIRS: &[&str] = &[
     "/usr/share/fonts/truetype/firacode",
     "/usr/share/fonts/truetype",
     "/usr/share/fonts",
+    // Arch, and Fedora's DejaVu package.
+    "/usr/share/fonts/TTF",
+    "/usr/share/fonts/dejavu-sans-fonts",
 ];
 
 #[cfg(not(windows))]
@@ -412,6 +415,40 @@ fn find_nerd_font() -> Option<(String, Vec<u8>)> {
     None
 }
 
+/// Faces for the arrows, math operators, check marks and other symbols that the body
+/// font and egui's bundled fonts lack (Ubuntu Sans has no arrows at all), so they are
+/// not drawn as boxes. The first group with a face present is used. Its faces go last
+/// in every family, after egui's emoji fonts, so whatever those draw looks the same; the
+/// Windows build loads Segoe UI Symbol for the same purpose (`SCRIPT_FACES`).
+#[cfg(not(any(target_os = "macos", windows)))]
+const SYMBOL_FACES: &[&[&str]] = &[&["DejaVuSans.ttf"], &["NotoSansMath-Regular.ttf", "NotoSansSymbols2-Regular.ttf"]];
+
+/// Append the first `SYMBOL_FACES` group found to every family, unless the body font
+/// (`body_file`) is one of them and so covers the symbols already.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn add_symbol_faces(defs: &mut FontDefinitions, body_file: Option<&str>) {
+    for group in SYMBOL_FACES {
+        if body_file.is_some_and(|b| group.contains(&b)) {
+            return;
+        }
+        let faces: Vec<(&str, Vec<u8>)> = group.iter().filter_map(|f| read(f).map(|b| (*f, b))).collect();
+        if faces.is_empty() {
+            continue;
+        }
+        let mut names = Vec::new();
+        for (file, bytes) in faces {
+            log::debug!("fonts: {file} for symbols");
+            let name = format!("mdread-symbols-{}", names.len());
+            defs.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
+            names.push(name);
+        }
+        for list in defs.families.values_mut() {
+            list.extend(names.iter().cloned());
+        }
+        return;
+    }
+}
+
 /// Size of code (inline and blocks) relative to the surrounding text.
 pub const CODE_SCALE: f32 = 0.88;
 
@@ -580,6 +617,9 @@ pub fn install(ctx: &Context) -> FontSet {
         let mono = defs.families.entry(FontFamily::Monospace).or_default();
         mono.insert(0, "mdread-mono".to_owned());
     }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    add_symbol_faces(&mut defs, SANS.iter().find(|c| c.name == sans_name).map(|c| c.regular));
 
     log::debug!("fonts: body {sans_name} (variable weight: {variable}, wght {wght_range:?}), code {mono_name}");
     #[cfg(windows)]
