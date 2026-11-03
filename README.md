@@ -13,14 +13,17 @@ code with syntect.
   and JetBrains Mono, Cascadia or any installed Nerd Font.
 - Widescreen layout: outline sidebar that tracks the section you are reading,
   files sidebar for the rest of the folder, and a reading column capped at a
-  comfortable measure (adjustable, or full width).
+  comfortable measure. Widen it from the status bar (`−` `860pt` `+`, or click
+  the width for presets) when tables or long lines need the room.
 - Live reload when the file changes on disk.
 - Dark and light themes, following the system by default.
 - GFM: tables, task lists, strikethrough, footnotes, alerts (`> [!NOTE]`),
   definition lists, front matter, math (shown as monospace), local and remote
   images (PNG, JPEG, GIF, WebP, SVG), inline badges, HTML `<img>`.
 - Links: web links open in the browser, relative `.md` links open in the
-  viewer (with back/forward), `#anchors` jump within the document.
+  viewer (back and forward with `←` `→` in the status bar), `#anchors` jump
+  within the document. The files sidebar keeps the folder you came from in
+  view; `↑` or a click on its folder name shows another.
 - Mermaid diagrams (```` ```mermaid ```` blocks) drawn natively, without a
   browser: flowcharts, sequence, class, state, ER, gantt, pie and the other
   Mermaid types, in Mermaid's dark theme on the dark page. A diagram wider than
@@ -156,9 +159,9 @@ the same share as the open document.
 | `o` | outline sidebar |
 | `f` | files sidebar |
 | `t` | dark / light |
-| `w` | full-width column; `[` `]` narrower / wider |
+| `w` | full-width column; `[` `]` narrower / wider in small steps |
 | `Ctrl +` `Ctrl -` `Ctrl 0`, `Ctrl`+scroll | zoom |
-| `Alt+←` `Backspace` / `Alt+→` | back / forward (also the mouse side buttons on Windows) |
+| `Alt+←` `Backspace` / `Alt+→` | back / forward (also the mouse side buttons, and `←` `→` in the status bar) |
 | `r` `F5` | reload |
 | `?` `F1` | help |
 | `q` `Ctrl+Q` | quit |

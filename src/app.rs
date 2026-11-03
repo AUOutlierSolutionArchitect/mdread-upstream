@@ -64,6 +64,49 @@ impl Default for Settings {
     }
 }
 
+/// Reading-column widths offered in the status bar, in points.
+const WIDTH_PRESETS: [(&str, f32); 4] = [("Narrow", 720.0), ("Normal", 860.0), ("Wide", 1200.0), ("Extra wide", 1600.0)];
+
+/// Bounds of `Settings::column_width`, in points.
+const MIN_COLUMN: f32 = 400.0;
+const MAX_COLUMN: f32 = 3000.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WidthStep {
+    Preset(f32),
+    Full,
+}
+
+/// A small button that shows its frame only when hovered, for the status bar and the
+/// sidebar header.
+fn flat_button(text: RichText) -> Button<'static> {
+    Button::new(text).frame_when_inactive(false).small()
+}
+
+/// An arrow for a `flat_button`, in the code font: the usual UI fonts (Ubuntu Sans,
+/// egui's own) have no arrows, and code fonts do.
+fn arrow(text: &str, size: f32, color: Color32) -> RichText {
+    RichText::new(text).size(size).color(color).family(egui::FontFamily::Monospace)
+}
+
+/// The last part of `dir`'s path, or all of it for a root (`/`, `C:\`).
+fn folder_name(dir: &Path) -> String {
+    dir.file_name().map_or_else(|| links::display_path(dir), |n| n.to_string_lossy().into_owned())
+}
+
+/// Where the status bar's − or + button goes from a column `now` points wide: the next
+/// narrower preset, or the next wider one that fits in `column_max` and then full width.
+fn width_step(now: f32, full_width: bool, column_max: f32, wider: bool) -> Option<WidthStep> {
+    let mut presets = WIDTH_PRESETS.iter().map(|p| p.1);
+    if !wider {
+        presets.rev().find(|&w| w < now - 1.0).map(WidthStep::Preset)
+    } else if full_width {
+        None
+    } else {
+        Some(presets.find(|&w| w > now + 1.0 && w < column_max - 1.0).map_or(WidthStep::Full, WidthStep::Preset))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Args {
     pub files: Vec<PathBuf>,
@@ -99,6 +142,15 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 /// How often the open file's stamp is checked on Windows, as a fallback for the watcher.
 #[cfg(windows)]
 const STAMP_POLL: Duration = Duration::from_secs(2);
+
+/// A file in the back/forward history, and how it was left.
+#[derive(Clone)]
+struct Visit {
+    path: PathBuf,
+    offset: f32,
+    /// The folder the files sidebar showed; `None` until the file is left.
+    files_dir: Option<PathBuf>,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Measure {
@@ -167,13 +219,15 @@ pub struct App {
 
     /// Reading-column viewport from the last frame, in points.
     content_rect: Rect,
+    /// Widest the reading column fits in the window, from the last frame, in points.
+    column_max: f32,
     menu: Option<ContextMenu>,
     /// Right-press position waiting for the next frame's hover info.
     menu_request: Option<Pos2>,
     /// A press was swallowed in `raw_input_hook`; swallow its release too.
     swallow_release: Option<PointerButton>,
 
-    history: Vec<(PathBuf, f32)>,
+    history: Vec<Visit>,
     history_pos: usize,
 
     watcher: Option<notify::RecommendedWatcher>,
@@ -305,6 +359,7 @@ impl App {
             diagrams: Diagrams::new(ctx.clone()),
             hovered_link: None,
             content_rect: Rect::NOTHING,
+            column_max: f32::INFINITY,
             menu: None,
             menu_request: None,
             swallow_release: None,
@@ -399,6 +454,12 @@ impl App {
     }
 
     fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) {
+        self.load_path_in(path, push_history, None, ctx);
+    }
+
+    /// Open `path` with the files sidebar showing `files_dir`, or a folder chosen by
+    /// `files::sidebar_root` when that is `None`.
+    fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) {
         // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
         // drives cannot be canonicalized; an absolute path still gives the folder links
         // and the sidebar start from.
@@ -408,13 +469,11 @@ impl App {
             Ok(bytes) => {
                 let decoded = text::decode(bytes);
                 if push_history {
-                    if let Some(cur) = self.history.get_mut(self.history_pos) {
-                        cur.1 = self.scroll_offset;
-                    }
+                    self.save_visit();
                     if !self.history.is_empty() {
                         self.history.truncate(self.history_pos + 1);
                     }
-                    self.history.push((path.clone(), 0.0));
+                    self.history.push(Visit { path: path.clone(), offset: 0.0, files_dir: None });
                     self.history_pos = self.history.len() - 1;
                 }
                 self.stdin_mode = false;
@@ -426,14 +485,9 @@ impl App {
                 self.jump = None;
                 self.reload_retries = 0;
                 self.setup_watcher(&path, stamp, ctx);
-                let dir = path.parent().map(Path::to_path_buf);
-                if dir != self.files_dir {
-                    self.files_dir = dir.clone();
-                    self.files.clear();
-                    if let Some(d) = dir {
-                        self.files_rx = Some(files::spawn_scan(d, ctx.clone()));
-                    }
-                }
+                let home = fonts::home_dir();
+                let dir = files_dir.or_else(|| files::sidebar_root(self.files_dir.as_deref(), &path, home.as_deref()));
+                self.set_files_dir(dir, ctx);
             }
             Err(e) => {
                 self.error = Some(format!("Cannot read {}: {e}", links::display_path(&path)));
@@ -555,7 +609,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let start_dir = self.files_dir.clone();
+        let start_dir = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf).or_else(|| self.files_dir.clone());
         // The native Open dialog, owned by the window so it stays on top of it and keeps it
         // disabled while open. It runs on the helper thread: its modal loop would stall
         // the event loop here.
@@ -649,18 +703,37 @@ impl App {
     }
 
     fn go_history(&mut self, delta: i32, ctx: &Context) {
-        let n = self.history.len() as i32;
-        let target = self.history_pos as i32 + delta;
-        if n == 0 || target < 0 || target >= n {
+        let Some(visit) = self.history_pos.checked_add_signed(delta as isize).and_then(|i| self.history.get(i)).cloned() else {
+            return;
+        };
+        self.save_visit();
+        self.history_pos = (self.history_pos as isize + delta as isize) as usize;
+        self.load_path_in(visit.path, false, visit.files_dir, ctx);
+        self.pending_offset = Some(visit.offset);
+    }
+
+    /// Note where the current file was left, for coming back to it.
+    fn save_visit(&mut self) {
+        if let Some(cur) = self.history.get_mut(self.history_pos) {
+            cur.offset = self.scroll_offset;
+            cur.files_dir = self.files_dir.clone();
+        }
+    }
+
+    /// The file `delta` steps back (-1) or forward (1) in the history.
+    fn history_neighbour(&self, delta: isize) -> Option<&Path> {
+        let i = self.history_pos.checked_add_signed(delta)?;
+        self.history.get(i).map(|v| v.path.as_path())
+    }
+
+    /// Show `dir` in the files sidebar, scanning it if it changed.
+    fn set_files_dir(&mut self, dir: Option<PathBuf>, ctx: &Context) {
+        if dir == self.files_dir {
             return;
         }
-        if let Some(cur) = self.history.get_mut(self.history_pos) {
-            cur.1 = self.scroll_offset;
-        }
-        self.history_pos = target as usize;
-        let (path, offset) = self.history[self.history_pos].clone();
-        self.load_path(path, false, ctx);
-        self.pending_offset = Some(offset);
+        self.files_dir = dir.clone();
+        self.files.clear();
+        self.files_rx = dir.map(|d| files::spawn_scan(d, ctx.clone()));
     }
 
     fn open_link(&mut self, url: &str, ctx: &Context) {
@@ -960,6 +1033,31 @@ impl App {
         self.settings.zoom = zoom;
     }
 
+    /// The reading column's width as drawn, in points.
+    fn column_now(&self) -> f32 {
+        if self.settings.full_width {
+            self.column_max
+        } else {
+            self.settings.column_width.min(self.column_max)
+        }
+    }
+
+    fn set_column_width(&mut self, w: f32) {
+        self.settings.full_width = false;
+        self.settings.column_width = w.clamp(MIN_COLUMN, MAX_COLUMN);
+    }
+
+    fn width_step(&self, wider: bool) -> Option<WidthStep> {
+        width_step(self.column_now(), self.settings.full_width, self.column_max, wider)
+    }
+
+    fn apply_width_step(&mut self, step: WidthStep) {
+        match step {
+            WidthStep::Preset(w) => self.set_column_width(w),
+            WidthStep::Full => self.settings.full_width = true,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Input
     // ------------------------------------------------------------------
@@ -990,15 +1088,12 @@ impl App {
                 zoom = Some(cur_zoom * zd);
             }
             cmds = key_commands(i, typing);
-            // The side buttons on the mouse, as in Explorer and browsers.
-            #[cfg(windows)]
-            {
-                if i.pointer.button_pressed(egui::PointerButton::Extra1) {
-                    cmds.push(Cmd::Back);
-                }
-                if i.pointer.button_pressed(egui::PointerButton::Extra2) {
-                    cmds.push(Cmd::Forward);
-                }
+            // The side buttons on the mouse, as in file managers and browsers.
+            if i.pointer.button_pressed(egui::PointerButton::Extra1) {
+                cmds.push(Cmd::Back);
+            }
+            if i.pointer.button_pressed(egui::PointerButton::Extra2) {
+                cmds.push(Cmd::Forward);
             }
         });
 
@@ -1066,8 +1161,14 @@ impl App {
                 Cmd::Files => self.settings.show_files = !self.settings.show_files,
                 Cmd::Theme => self.toggle_theme(ctx),
                 Cmd::Width => self.settings.full_width = !self.settings.full_width,
-                Cmd::Narrower => self.settings.column_width = (self.settings.column_width - 60.0).max(400.0),
-                Cmd::Wider => self.settings.column_width = (self.settings.column_width + 60.0).min(3000.0),
+                // From the width as drawn, so the first press out of full width (or a
+                // column the window caps) narrows it.
+                Cmd::Narrower => self.set_column_width(self.column_now() - 60.0),
+                Cmd::Wider => {
+                    if !self.settings.full_width {
+                        self.set_column_width(self.settings.column_width + 60.0);
+                    }
+                }
                 Cmd::Help => self.show_help = !self.show_help,
                 Cmd::ZoomReset => self.zoom_to(ctx, 1.0),
             }
@@ -1248,14 +1349,18 @@ impl App {
     }
 
     fn show_files_panel(&mut self, ui: &mut Ui, ctx: &Context) {
-        if self.files.len() < 2 {
+        let Some(dir) = self.files_dir.clone() else { return };
+        let open_dir = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        // A lone file has no use for the sidebar, unless a link or the sidebar led
+        // somewhere and it shows the way back.
+        if self.files.len() < 2 && self.history.len() < 2 && open_dir.as_ref() == Some(&dir) {
             return;
         }
-        let Some(dir) = self.files_dir.clone() else { return };
         let base = self.settings.base_size;
         let pal = self.pal;
         let current = self.path.clone();
         let mut clicked: Option<PathBuf> = None;
+        let mut show_dir: Option<PathBuf> = None;
         Panel::right("files")
             .resizable(true)
             .default_size(260.0)
@@ -1265,8 +1370,26 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("FILES").size(base * 0.72).color(pal.text_dim));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        ui.add(Label::new(RichText::new(name).size(base * 0.72).color(pal.text_dim)).truncate());
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let up = dir.parent();
+                        let up_hint = up.map(|u| format!("Show the folder above: {}", folder_name(u))).unwrap_or_default();
+                        if ui.add_enabled(up.is_some(), flat_button(arrow("↑", base * 0.78, pal.text_dim))).on_hover_text(up_hint).clicked() {
+                            show_dir = up.map(Path::to_path_buf);
+                        }
+                        // The folder shown, with a menu of the open file's folder and those
+                        // above it, to go back down after going up.
+                        let resp = ui
+                            .add(flat_button(RichText::new(folder_name(&dir)).size(base * 0.72).color(pal.text_dim)).truncate())
+                            .on_hover_text(format!("{}\nClick to show another folder", links::display_path(&dir)));
+                        Popup::menu(&resp).show(|ui| {
+                            for d in open_dir.iter().flat_map(|d| d.ancestors()) {
+                                let here = Some(d) == open_dir.as_deref();
+                                let item = Button::selectable(d == dir, folder_name(d)).right_text(if here { "open file" } else { "" });
+                                if ui.add(item).on_hover_text(links::display_path(d)).clicked() {
+                                    show_dir = Some(d.to_path_buf());
+                                }
+                            }
+                        });
                     });
                 });
                 ui.add_space(6.0);
@@ -1306,6 +1429,9 @@ impl App {
                     }
                 });
             });
+        if let Some(d) = show_dir {
+            self.set_files_dir(Some(d), ctx);
+        }
         if let Some(p) = clicked {
             self.load_path(p, true, ctx);
         }
@@ -1388,12 +1514,17 @@ impl App {
         let base = self.settings.base_size;
         let pal = self.pal;
         let small = base * 0.78;
+        let mut nav = None;
         Panel::bottom("status")
             .resizable(false)
             .show_separator_line(true)
             .frame(Frame::new().fill(pal.panel_bg).inner_margin(Margin::symmetric(12, 5)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if self.history.len() > 1 {
+                        nav = self.history_buttons(ui, small);
+                        ui.add_space(6.0);
+                    }
                     let path_text = if self.stdin_mode {
                         "stdin".to_owned()
                     } else {
@@ -1421,13 +1552,84 @@ impl App {
                             ui.label(RichText::new(format!("{words} words · {mins} min")).size(small).color(pal.text_dim));
                         }
                         ui.separator();
-                        let width_label = if self.settings.full_width { "full width".to_owned() } else { format!("{:.0}pt", self.settings.column_width) };
-                        ui.label(RichText::new(width_label).size(small).color(pal.text_dim)).on_hover_text("Reading column width ([ ] to adjust, w for full width)");
+                        self.width_controls(ui, small);
                         ui.separator();
                         ui.label(RichText::new("? help").size(small).color(pal.text_dim));
                     });
                 });
             });
+        if let Some(delta) = nav {
+            let ctx = ui.ctx().clone();
+            self.go_history(delta, &ctx);
+        }
+    }
+
+    /// ← → in the status bar, for going back to the file a link came from. Returns the
+    /// step clicked.
+    fn history_buttons(&self, ui: &mut Ui, size: f32) -> Option<i32> {
+        let mut nav = None;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (delta, glyph, verb, keys) in [(-1, "←", "Back", "Alt+Left, Backspace or the mouse back button"), (1, "→", "Forward", "Alt+Right")] {
+                let to = self.history_neighbour(delta);
+                let resp = ui.add_enabled(to.is_some(), flat_button(arrow(glyph, size, self.pal.text_dim)));
+                if let Some(to) = to {
+                    // The folder too: links often lead to another README.md.
+                    let shown = match to.parent() {
+                        Some(dir) => format!("{}/{}", folder_name(dir), to.file_name().unwrap_or_default().to_string_lossy()),
+                        None => links::display_path(to),
+                    };
+                    if resp.on_hover_text(format!("{verb} to {shown} ({keys})")).clicked() {
+                        nav = Some(delta as i32);
+                    }
+                }
+            }
+        });
+        nav
+    }
+
+    /// `− 860pt +` in the status bar, which runs right to left: the buttons step through
+    /// the width presets, and the width opens a menu of them.
+    fn width_controls(&mut self, ui: &mut Ui, size: f32) {
+        let pal = self.pal;
+        let flat = |text: &str| flat_button(RichText::new(text).size(size).color(pal.text_dim));
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let wider = self.width_step(true);
+            if ui.add_enabled(wider.is_some(), flat("+")).on_hover_text("Wider (] in small steps)").clicked() {
+                if let Some(step) = wider {
+                    self.apply_width_step(step);
+                }
+            }
+            let label = if self.settings.full_width { "full width".to_owned() } else { format!("{:.0}pt", self.column_now()) };
+            // Wide enough for "full width", so the − button stays put while stepping.
+            let full_w = ui.painter().layout_no_wrap("full width".to_owned(), egui::FontId::proportional(size), pal.text_dim).size().x;
+            let min_w = full_w + 2.0 * ui.spacing().button_padding.x;
+            let resp = ui
+                .add(flat(&label).min_size(vec2(min_w, 0.0)))
+                .on_hover_text("Reading column width: click for presets (w toggles full width)");
+            Popup::menu(&resp).show(|ui| {
+                for (name, w) in WIDTH_PRESETS {
+                    let on = !self.settings.full_width && (self.settings.column_width - w).abs() < 0.5;
+                    let fits = w <= self.column_max + 1.0;
+                    let item = Button::selectable(on, name).right_text(format!("{w:.0}pt"));
+                    let resp = ui.add_enabled(fits || on, item).on_disabled_hover_text("Wider than the window");
+                    if resp.clicked() {
+                        self.set_column_width(w);
+                    }
+                }
+                ui.separator();
+                if ui.add(Button::selectable(self.settings.full_width, "Full width").right_text("w")).clicked() {
+                    self.settings.full_width = true;
+                }
+            });
+            let narrower = self.width_step(false);
+            if ui.add_enabled(narrower.is_some(), flat("−")).on_hover_text("Narrower ([ in small steps)").clicked() {
+                if let Some(step) = narrower {
+                    self.apply_width_step(step);
+                }
+            }
+        });
     }
 
     fn show_help(&mut self, ctx: &Context) {
@@ -1448,7 +1650,7 @@ impl App {
                 let find_key = format!("{CMD}+F  /");
                 let zoom_key = format!("{CMD} + −  0   {CMD}+scroll");
                 let quit_key = format!("q  {CMD}+Q");
-                let mut rows: Vec<(&str, &str)> = vec![
+                let rows: Vec<(&str, &str)> = vec![
                     (&open_key, "Open file"),
                     (&find_key, "Find in document"),
                     ("Enter  n  N", "Next / previous match"),
@@ -1461,16 +1663,16 @@ impl App {
                     ("t", "Toggle dark / light theme"),
                     ("w   [  ]", "Full-width column / narrower / wider"),
                     (&zoom_key, "Zoom"),
-                    ("Alt+←  Backspace  /  Alt+→", "Back / forward"),
+                    ("Alt+←  Backspace  /  Alt+→", "Back / forward (also the arrows in the status bar)"),
+                    ("Mouse side buttons", "Back / forward"),
                     ("r  F5", "Reload (files also reload automatically)"),
                     ("Click link", "Open in browser, or follow to another .md"),
                     ("Hover code block", "Copy button"),
                     ("Right-click", "Copy selection, open or copy link"),
+                    ("Click width in status bar", "Column width presets (− + step through them)"),
+                    ("↑ or folder name in Files", "Show the folder above, or pick one"),
                     (&quit_key, "Quit"),
                 ];
-                if cfg!(windows) {
-                    rows.insert(13, ("Mouse side buttons", "Back / forward"));
-                }
                 egui::Grid::new("help-grid").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
                     for (k, v) in &rows {
                         ui.label(RichText::new(*k).monospace().color(pal.accent));
@@ -1523,6 +1725,7 @@ impl App {
         } else {
             (avail_w - 2.0 * margin).min(self.settings.column_width).max(200.0)
         };
+        self.column_max = (avail_w - 2.0 * margin).max(200.0);
         let left_pad = ((avail_w - col_w) / 2.0).max(margin);
         let key = ((col_w * 2.0).round() as i32, (base * 100.0) as i32);
         if key != self.layout_key {
@@ -2077,6 +2280,25 @@ mod tests {
     } else {
         Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
     };
+
+    #[test]
+    fn width_buttons_step_through_presets() {
+        use WidthStep::{Full, Preset};
+        let wide_window = 2400.0;
+        assert_eq!(width_step(860.0, false, wide_window, true), Some(Preset(1200.0)));
+        assert_eq!(width_step(1600.0, false, wide_window, true), Some(Full));
+        assert_eq!(width_step(860.0, false, wide_window, false), Some(Preset(720.0)));
+        assert_eq!(width_step(720.0, false, wide_window, false), None);
+        // Widths set with [ and ] step to the nearest preset.
+        assert_eq!(width_step(920.0, false, wide_window, true), Some(Preset(1200.0)));
+        assert_eq!(width_step(920.0, false, wide_window, false), Some(Preset(860.0)));
+        // Full width goes no wider, and narrower goes below the window's width.
+        assert_eq!(width_step(wide_window, true, wide_window, true), None);
+        assert_eq!(width_step(wide_window, true, wide_window, false), Some(Preset(1600.0)));
+        // Presets wider than the window are skipped: the column already fills it.
+        assert_eq!(width_step(860.0, false, 1100.0, true), Some(Full));
+        assert_eq!(width_step(1100.0, true, 1100.0, false), Some(Preset(860.0)));
+    }
 
     fn keys(presses: &[(Modifiers, Key)], typing: bool) -> Vec<Cmd> {
         let mut i = egui::InputState::default();

@@ -234,7 +234,7 @@ const MONO_FALLBACK: &[(&str, &str)] = &[
 /// The user's home directory. Windows has no HOME unless a POSIX shell exported one
 /// (Git Bash sets it to `/c/Users/...`, which is not a Windows path), so there the
 /// profile directory is used instead.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     #[cfg(windows)]
     return var("HOME").filter(|h| h.is_absolute()).or_else(|| var("USERPROFILE"));
