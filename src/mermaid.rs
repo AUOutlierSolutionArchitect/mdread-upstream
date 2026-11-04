@@ -155,9 +155,8 @@ impl Diagrams {
                     let current = self.current.load(Ordering::Relaxed);
                     let Some(e) = self.entries.get_mut(&key) else { continue };
                     // A diagram the current document still shows (a reload that left it
-                    // unchanged) is sent again rather than left to status(): after the first
-                    // frame of a document only the blocks in view ask for theirs, and the
-                    // others must still be laid out for the document's height to be known.
+                    // unchanged) is sent again here: status() only sends one it has no entry
+                    // for, and it must still be laid out for the document's height to be known.
                     match on_skipped(matches!(e.state, State::Pending), e.gen, e.sent, gen, current) {
                         OnSkip::Resend => {
                             e.sent = current;

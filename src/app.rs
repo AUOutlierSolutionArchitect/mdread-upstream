@@ -156,6 +156,9 @@ struct Visit {
 struct Measure {
     height: f32,
     measured: bool,
+    /// The block drew an image or diagram that was still loading, so `height` has its
+    /// placeholder's size rather than its own.
+    pending: bool,
 }
 
 /// The right-click menu over the reading column.
@@ -210,7 +213,7 @@ pub struct App {
     pending_offset: Option<f32>,
     scroll_delta: f32,
     jump: Option<(usize, u8)>,
-    /// Until when a jump waits for diagrams above its target to be laid out.
+    /// Until when a jump waits for diagrams and images above its target to load.
     jump_until: Instant,
     pending_anchor: Option<String>,
 
@@ -1783,6 +1786,8 @@ impl App {
         let measures = &mut self.measures;
         let block_tops = &mut self.block_tops;
         let gap = rc.gap();
+        // An image or diagram above a jump's target that is still loading will move it.
+        let mut pending_above_target = false;
 
         let out = sa.show_viewport(ui, |ui, _viewport| {
             if scroll_delta != 0.0 {
@@ -1806,13 +1811,15 @@ impl App {
                     let est = if m.measured { m.height } else { estimate_height(block, col_w, base) + gap };
                     let in_view = top <= visible.max.y && top + est >= visible.min.y;
                     let is_target = jump.map(|(b, _)| b == i).unwrap_or(false);
-                    if in_view || measure_all || is_target || !m.measured && i + 1 == n {
+                    if lay_out_block(m, in_view, measure_all, is_target, i + 1 == n) {
+                        rc.pending = false;
                         rc.show_block(ui, block);
                         if i + 1 < n {
                             ui.add_space(gap);
                         }
                         let h = ui.cursor().top() - top;
-                        measures[i] = Measure { height: h, measured: true };
+                        measures[i] = Measure { height: h, measured: true, pending: rc.pending };
+                        pending_above_target |= rc.pending && jump.is_some_and(|(b, _)| i < b);
                     } else {
                         ui.allocate_space(vec2(col_w, est));
                     }
@@ -1852,9 +1859,11 @@ impl App {
         self.content_gen = self.gen;
 
         if let Some((b, left)) = self.jump {
-            if self.diagrams.laying_out() && Instant::now() < self.jump_until {
-                // Diagrams grow once laid out, which moves the target; hold it in place until
-                // they are (the worker repaints after each one).
+            if (self.diagrams.laying_out() || pending_above_target) && Instant::now() < self.jump_until {
+                // Diagrams grow once laid out, and images once loaded, which moves the target;
+                // hold it in place until they are (the diagram worker and egui's image loader
+                // repaint when done). Images below the target do not move it, and a slow one
+                // there must not keep overriding the user's own scrolling.
             } else if left == 0 {
                 self.jump = None;
             } else {
@@ -2300,6 +2309,17 @@ fn scroll_target(requested: f32, content_h: f32, measured_this_doc: bool) -> Opt
     }
 }
 
+/// Whether a block is laid out this frame rather than given its last measured (or estimated)
+/// height: it is near the view, every block is being measured, a jump is heading for it, it
+/// is the last block and has never been measured, or an image or diagram in it was still
+/// loading when it was. Every block is measured on a document's first frame only, when its
+/// images are still being read on egui's loader thread; without the pending case, one off
+/// screen would keep its 24 px placeholder height, and history, reload, the percentage and
+/// the scrollbar would all work from it.
+fn lay_out_block(m: Measure, in_view: bool, measure_all: bool, is_target: bool, last: bool) -> bool {
+    in_view || measure_all || is_target || m.pending || !m.measured && last
+}
+
 /// Puts the content scroll area at `y` this frame (`measured_this_doc` as for `scroll_target`).
 ///
 /// On the first frame of a new document the scroll area still has the previous one's bounds.
@@ -2431,6 +2451,24 @@ mod tests {
         // End in the frame a reload or the Open dialog changed the document: f32::MAX must
         // not reach the layout, so it waits a frame for the new page's height.
         assert_eq!(scroll_target(f32::MAX, 1900.0, false), None);
+    }
+
+    #[test]
+    fn blocks_measured_while_loading_are_laid_out_again() {
+        let settled = Measure { height: 300.0, measured: true, pending: false };
+        let loading = Measure { height: 24.0, measured: true, pending: true };
+        // Off screen, after the first frame: an image or diagram that was still loading when
+        // the block was measured is laid out until it has its own size...
+        assert!(lay_out_block(loading, false, false, false, false));
+        // ...while a settled block keeps its height.
+        assert!(!lay_out_block(settled, false, false, false, false));
+        // The other reasons still hold.
+        assert!(lay_out_block(settled, true, false, false, false));
+        assert!(lay_out_block(settled, false, true, false, false));
+        assert!(lay_out_block(settled, false, false, true, false));
+        assert!(lay_out_block(Measure::default(), false, false, false, true));
+        assert!(!lay_out_block(settled, false, false, false, true));
+        assert!(!lay_out_block(Measure::default(), false, false, false, false));
     }
 
     #[test]
