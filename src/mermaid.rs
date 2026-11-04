@@ -352,7 +352,7 @@ impl Fonts {
         // connect to that host.
         opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
         opt.font_resolver.select_fallback =
-            Box::new(move |c, used, db| loaded(c, used, db).or_else(|| load_fallback(system, missing, c, db)));
+            Box::new(move |c, used, db| loaded(c, used, db).or_else(|| load_fallback(system, missing, c, used, db)));
         let tree = usvg::Tree::from_str(svg, &opt)?;
         // Keep the fallback fonts loaded for this diagram for the next ones.
         self.db = tree.fontdb().clone();
@@ -443,11 +443,13 @@ fn add_family(system: &fontdb::Database, db: &mut fontdb::Database, names: &[&st
     None
 }
 
-/// Finds an installed font that has `c`, preferring a regular face, and adds it to `db`.
+/// Finds an installed font that has `c`, preferring a regular face, and adds it to `db`
+/// unless it is there already. `used` are the faces this text was shaped with so far.
 fn load_fallback(
     system: &fontdb::Database,
     missing: &Mutex<HashSet<char>>,
     c: char,
+    used: &[fontdb::ID],
     db: &mut Arc<fontdb::Database>,
 ) -> Option<fontdb::ID> {
     let mut missing = missing.lock().ok()?;
@@ -463,9 +465,20 @@ fn load_fallback(
         missing.insert(c);
         return None;
     };
+    let path = face_path(face)?;
+    // usvg asks for the first character of a cluster as long as any glyph in it is missing,
+    // so a mark that no font has after a letter ("a\u{20D7}", or the U+20E3 of a keycap
+    // emoji) asks for the letter again and again. Loading the same file under a new ID each
+    // time would never end, so a face that is already loaded is not loaded again, and once
+    // this text was shaped with it None ends the fallback for the whole text: the mark, and
+    // anything after it that needs another font, is left undrawn. `c` itself is not missing.
+    let copies: Vec<fontdb::ID> = db.faces().filter(|f| f.index == face.index && face_path(f) == Some(path)).map(|f| f.id).collect();
+    if !copies.is_empty() {
+        return copies.into_iter().find(|id| !used.contains(id));
+    }
     let db = Arc::make_mut(db);
     let before: HashSet<fontdb::ID> = db.faces().map(|f| f.id).collect();
-    db.load_font_file(face_path(face)?).ok()?;
+    db.load_font_file(path).ok()?;
     log::debug!("diagram text: {c:?} from {}", face.post_script_name);
     db.faces().find(|f| !before.contains(&f.id) && f.index == face.index).map(|f| f.id)
 }
@@ -506,5 +519,35 @@ mod tests {
             assert!(tw <= 32768 && th <= 32768);
             assert!((tw as f32 / th as f32 - w / h).abs() < 0.01 * w / h, "{w}x{h} -> {tw}x{th}");
         }
+    }
+
+    #[test]
+    fn fallback_for_a_mark_no_font_has_ends() {
+        // egui's Ubuntu Light as the only installed font, so the test does not depend on the
+        // machine's fonts. It has 'a' but not U+20D7, the combining arrow above.
+        let dir = std::env::temp_dir().join(format!("mdread-fallback-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let defs = egui::FontDefinitions::default();
+        std::fs::write(dir.join("Ubuntu-Light.ttf"), (*defs.font_data["Ubuntu-Light"].font).as_ref()).unwrap();
+        let mut system = fontdb::Database::new();
+        system.load_fonts_dir(&dir);
+        let mut db = fontdb::Database::new();
+        let sans = add_family(&system, &mut db, &["Ubuntu", "Ubuntu Light"]).expect("Ubuntu Light loads");
+        db.set_sans_serif_family(sans.as_str());
+        db.set_serif_family(sans.as_str());
+        let mut fonts = Fonts { db: Arc::new(db), system, missing: Mutex::default(), environment: SvgEnvironment::deterministic() };
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text x="10" y="30" font-family="&quot;trebuchet ms&quot;, sans-serif">a&#x20D7;</text></svg>"#;
+        // On a thread, so that a loop fails the test instead of hanging it.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let faces = fonts.parse(svg).map(|tree| tree.fontdb().len());
+            let _ = tx.send((faces, fonts.missing.lock().unwrap().contains(&'a')));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (faces, missing) = result.expect("font fallback did not end");
+        // The font it was drawn with is not loaded again, and 'a' is not taken for a character no font has.
+        assert_eq!(faces.expect("the SVG parses"), 1);
+        assert!(!missing);
     }
 }
