@@ -53,6 +53,10 @@ pub struct RenderCtx<'a> {
     pub hover: Hover,
     /// Horizontal extent that content wider than the column may take, e.g. diagrams.
     pub wide: Rangef,
+    /// Set when an image or diagram drawn was still loading and took a placeholder's size
+    /// (egui lays out a pending image at 24 px). The caller clears it before a block and
+    /// lays that block out again on later frames until it is no longer set.
+    pub pending: bool,
     list_depth: u8,
     text_color: Color32,
     scale: f32,
@@ -102,6 +106,7 @@ impl<'a> RenderCtx<'a> {
             actions: Vec::new(),
             hover: Hover::default(),
             wide: Rangef::NOTHING,
+            pending: false,
             list_depth: 0,
             text_color: pal.text,
             scale: 1.0,
@@ -424,7 +429,10 @@ impl<'a> RenderCtx<'a> {
                 log::debug!("image {}: {err}", img.url);
                 ui.label(RichText::new(format!("⊠ {alt}")).italics().color(self.pal.text_dim).size(fs * 0.9));
             }
-            Ok(_) => {
+            Ok(poll) => {
+                // egui_extras loads every file on a thread, so this is pending on the first
+                // frame of an image not yet in its cache.
+                self.pending |= matches!(poll, egui::load::TexturePoll::Pending { .. });
                 let resp = ui.add(image);
                 if ui.rect_contains_pointer(resp.rect) {
                     self.hover.image = Some(uri);
@@ -442,6 +450,7 @@ impl<'a> RenderCtx<'a> {
             match self.diagrams.status(self.gen, &cb.text, self.pal.dark) {
                 Status::Ready(d) => return self.show_diagram(ui, cb, d),
                 Status::Pending => {
+                    self.pending = true;
                     let fs = self.fs();
                     ui.label(RichText::new("Drawing diagram…").italics().color(self.pal.text_dim).size(fs * 0.9));
                     return;

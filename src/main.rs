@@ -35,8 +35,9 @@ OPTIONS:
     --system             Follow the system theme for this session (the default
                          until a theme is picked in mdread)
     --find TERM          Open with the search box filled in
-    --screenshot PATH    Save a PNG of the window after 1.5 s and exit
-    --screenshot-delay N Delay in ms for --screenshot
+    --screenshot PATH    Save a PNG of the window and exit, once diagrams, images
+                         and highlighting are done and at least 1.5 s have passed
+    --screenshot-delay N Least delay in ms for --screenshot
     -h, --help           Show this help
     -V, --version        Show version
 

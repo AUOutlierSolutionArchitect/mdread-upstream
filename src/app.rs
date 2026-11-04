@@ -156,6 +156,9 @@ struct Visit {
 struct Measure {
     height: f32,
     measured: bool,
+    /// The block drew an image or diagram that was still loading, so `height` has its
+    /// placeholder's size rather than its own.
+    pending: bool,
 }
 
 /// The right-click menu over the reading column.
@@ -210,7 +213,7 @@ pub struct App {
     pending_offset: Option<f32>,
     scroll_delta: f32,
     jump: Option<(usize, u8)>,
-    /// Until when a jump waits for diagrams above its target to be laid out.
+    /// Until when a jump waits for diagrams and images above its target to load.
     jump_until: Instant,
     pending_anchor: Option<String>,
 
@@ -262,6 +265,8 @@ pub struct App {
     screenshot_delay_ms: u64,
     /// Where the screenshot lands once requested and taken.
     screenshot_taken: Option<Arc<egui::mutex::Mutex<Option<Arc<egui::ColorImage>>>>>,
+    /// The screenshot was requested at the wait limit, before the page had finished drawing.
+    screenshot_unsettled: bool,
     /// Whether the title bar was last made dark (Windows; None before the first frame).
     #[cfg(windows)]
     title_bar_dark: Option<bool>,
@@ -391,6 +396,7 @@ impl App {
             screenshot: args.screenshot.clone(),
             screenshot_delay_ms: args.screenshot_delay_ms,
             screenshot_taken: None,
+            screenshot_unsettled: false,
             #[cfg(windows)]
             title_bar_dark: None,
         };
@@ -1783,6 +1789,8 @@ impl App {
         let measures = &mut self.measures;
         let block_tops = &mut self.block_tops;
         let gap = rc.gap();
+        // An image or diagram above a jump's target that is still loading will move it.
+        let mut pending_above_target = false;
 
         let out = sa.show_viewport(ui, |ui, _viewport| {
             if scroll_delta != 0.0 {
@@ -1806,13 +1814,15 @@ impl App {
                     let est = if m.measured { m.height } else { estimate_height(block, col_w, base) + gap };
                     let in_view = top <= visible.max.y && top + est >= visible.min.y;
                     let is_target = jump.map(|(b, _)| b == i).unwrap_or(false);
-                    if in_view || measure_all || is_target || !m.measured && i + 1 == n {
+                    if lay_out_block(m, in_view, measure_all, is_target, i + 1 == n) {
+                        rc.pending = false;
                         rc.show_block(ui, block);
                         if i + 1 < n {
                             ui.add_space(gap);
                         }
                         let h = ui.cursor().top() - top;
-                        measures[i] = Measure { height: h, measured: true };
+                        measures[i] = Measure { height: h, measured: true, pending: rc.pending };
+                        pending_above_target |= rc.pending && jump.is_some_and(|(b, _)| i < b);
                     } else {
                         ui.allocate_space(vec2(col_w, est));
                     }
@@ -1852,9 +1862,11 @@ impl App {
         self.content_gen = self.gen;
 
         if let Some((b, left)) = self.jump {
-            if self.diagrams.laying_out() && Instant::now() < self.jump_until {
-                // Diagrams grow once laid out, which moves the target; hold it in place until
-                // they are (the worker repaints after each one).
+            if (self.diagrams.laying_out() || pending_above_target) && Instant::now() < self.jump_until {
+                // Diagrams grow once laid out, and images once loaded, which moves the target;
+                // hold it in place until they are (the diagram worker and egui's image loader
+                // repaint when done). Images below the target do not move it, and a slow one
+                // there must not keep overriding the user's own scrolling.
             } else if left == 0 {
                 self.jump = None;
             } else {
@@ -1900,13 +1912,29 @@ impl App {
         if let Some(img) = shot {
             let [w, h] = img.size;
             crate::cli_console(true);
+            if self.screenshot_unsettled {
+                eprintln!("screenshot taken before the page had finished drawing ({} s past the delay)", SCREENSHOT_WAIT_MAX.as_secs());
+            }
             match image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => eprintln!("screenshot saved to {} ({w}x{h})", path.display()),
                 Err(e) => eprintln!("screenshot failed: {e}"),
             }
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
-            if self.screenshot_taken.is_none() && self.started.elapsed() >= Duration::from_millis(self.screenshot_delay_ms) {
+            // Diagrams are laid out and drawn, and code highlighted, on worker threads, and
+            // images read on egui's loader thread (a block that drew one still loading is
+            // re-measured every frame until it arrives, so its flag clears then); a jump to
+            // an anchor or a restored scroll position moves the page once the blocks above
+            // it are measured. eframe captures the frame painted after the request, and
+            // this runs at the end of the frame, after show_content queued this frame's
+            // work, so one settled frame is enough. Without a document nothing is loading.
+            let images_loading = self.doc.is_some() && self.measures.iter().any(|m| m.pending);
+            let settled = !self.diagrams.busy() && !self.hl.busy() && !images_loading && self.jump.is_none() && self.pending_offset.is_none();
+            if self.screenshot_taken.is_none() && screenshot_due(self.started.elapsed(), Duration::from_millis(self.screenshot_delay_ms), settled) {
+                if !settled {
+                    log::warn!("taking the screenshot before the page has finished drawing");
+                    self.screenshot_unsettled = true;
+                }
                 let taken = Arc::new(egui::mutex::Mutex::new(None));
                 self.screenshot_taken = Some(taken.clone());
                 log::debug!("requesting screenshot at frame {}", self.frames);
@@ -1937,6 +1965,18 @@ impl App {
     }
 }
 
+/// How long `--screenshot` waits past its delay for diagrams, images and highlighting. It
+/// must not wait for ever: the 10 s layout limit is per diagram and the worker lays them
+/// out one at a time, so a page with several slow ones takes a multiple of it, a worker
+/// that died leaves its diagrams pending for good, and a remote image can be slow.
+const SCREENSHOT_WAIT_MAX: Duration = Duration::from_secs(20);
+
+/// Whether to take the `--screenshot` now, `elapsed` after launch: once the `delay` has
+/// passed and the page is `settled`, or `SCREENSHOT_WAIT_MAX` after the delay regardless.
+fn screenshot_due(elapsed: Duration, delay: Duration, settled: bool) -> bool {
+    elapsed >= delay && (settled || elapsed >= delay + SCREENSHOT_WAIT_MAX)
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1950,7 +1990,6 @@ impl eframe::App for App {
         self.add_ui_script_fallbacks(&ctx);
         #[cfg(windows)]
         self.sync_title_bar(frame);
-        self.handle_screenshot(&ctx);
 
         self.show_status_bar(ui);
         if self.search.open {
@@ -1970,6 +2009,8 @@ impl eframe::App for App {
             });
         self.show_context_menu(&ctx);
         self.show_help(&ctx);
+        // Last, so that it sees the diagram drawing and highlighting show_content asked for.
+        self.handle_screenshot(&ctx);
         log::trace!(
             "frame {} at {:.0} ms took {:.2} ms",
             self.frames,
@@ -2300,6 +2341,17 @@ fn scroll_target(requested: f32, content_h: f32, measured_this_doc: bool) -> Opt
     }
 }
 
+/// Whether a block is laid out this frame rather than given its last measured (or estimated)
+/// height: it is near the view, every block is being measured, a jump is heading for it, it
+/// is the last block and has never been measured, or an image or diagram in it was still
+/// loading when it was. Every block is measured on a document's first frame only, when its
+/// images are still being read on egui's loader thread; without the pending case, one off
+/// screen would keep its 24 px placeholder height, and history, reload, the percentage and
+/// the scrollbar would all work from it.
+fn lay_out_block(m: Measure, in_view: bool, measure_all: bool, is_target: bool, last: bool) -> bool {
+    in_view || measure_all || is_target || m.pending || !m.measured && last
+}
+
 /// Puts the content scroll area at `y` this frame (`measured_this_doc` as for `scroll_target`).
 ///
 /// On the first frame of a new document the scroll area still has the previous one's bounds.
@@ -2332,6 +2384,19 @@ mod tests {
     } else {
         Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
     };
+
+    #[test]
+    fn screenshot_waits_for_the_delay_then_for_the_page_to_settle() {
+        let ms = Duration::from_millis;
+        let delay = ms(1500);
+        // The delay is a minimum, even when there is nothing to wait for.
+        assert!(!screenshot_due(ms(1499), delay, true));
+        assert!(screenshot_due(delay, delay, true));
+        // After it, a page still drawing diagrams, images or highlighting is waited for...
+        assert!(!screenshot_due(delay + SCREENSHOT_WAIT_MAX - ms(1), delay, false));
+        // ...but not forever.
+        assert!(screenshot_due(delay + SCREENSHOT_WAIT_MAX, delay, false));
+    }
 
     #[test]
     fn width_buttons_step_through_presets() {
@@ -2431,6 +2496,24 @@ mod tests {
         // End in the frame a reload or the Open dialog changed the document: f32::MAX must
         // not reach the layout, so it waits a frame for the new page's height.
         assert_eq!(scroll_target(f32::MAX, 1900.0, false), None);
+    }
+
+    #[test]
+    fn blocks_measured_while_loading_are_laid_out_again() {
+        let settled = Measure { height: 300.0, measured: true, pending: false };
+        let loading = Measure { height: 24.0, measured: true, pending: true };
+        // Off screen, after the first frame: an image or diagram that was still loading when
+        // the block was measured is laid out until it has its own size...
+        assert!(lay_out_block(loading, false, false, false, false));
+        // ...while a settled block keeps its height.
+        assert!(!lay_out_block(settled, false, false, false, false));
+        // The other reasons still hold.
+        assert!(lay_out_block(settled, true, false, false, false));
+        assert!(lay_out_block(settled, false, true, false, false));
+        assert!(lay_out_block(settled, false, false, true, false));
+        assert!(lay_out_block(Measure::default(), false, false, false, true));
+        assert!(!lay_out_block(settled, false, false, false, true));
+        assert!(!lay_out_block(Measure::default(), false, false, false, false));
     }
 
     #[test]

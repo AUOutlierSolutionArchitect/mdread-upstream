@@ -141,22 +141,32 @@ function Test-SameDir([string]$A, [string]$B) {
     return $left -ieq $right
 }
 
-# Rewrites the user PATH without $Dir, appending it again when $Add is set, so
-# repeated runs never duplicate it. Read unexpanded and written back as
-# REG_EXPAND_SZ so %VARS% in other entries survive (setx would expand them).
+# Removes $Dir from the user PATH, or appends it when $Add is set and it is not
+# there yet, so repeated runs never duplicate it. The rest of the PATH is kept
+# character for character, empty entries and a trailing ';' included: other
+# tools append 'dir;' on the assumption that the PATH ends in ';' (the stock
+# user PATH does), and -Uninstall gives back exactly what the install found.
+# Read unexpanded and written back as REG_EXPAND_SZ so %VARS% in other entries
+# survive (setx would expand them). mdread.iss's UpdateUserPath does the same.
 function Update-UserPath([string]$Dir, [bool]$Add) {
     $key = $Hkcu.CreateSubKey('Environment')
     try {
         $old = [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-        $entries = @($old -split ';' | Where-Object { $_.Trim() -ne '' })
-        $kept = @($entries | Where-Object { -not (Test-SameDir $_ $Dir) })
+        $parts = @($old -split ';')
+        $kept = @($parts | Where-Object { $_.Trim() -eq '' -or -not (Test-SameDir $_ $Dir) })
         if ($Add) {
-            if ($kept.Count -ne $entries.Count) { return $false }
-            $kept += $Dir
-        } elseif ($kept.Count -eq $entries.Count) {
+            if ($kept.Count -ne $parts.Count) { return $false }
+            # $Dir goes before a trailing ';', so the PATH keeps ending in one
+            # and -Uninstall restores it exactly.
+            if ($old -eq '') { $new = $Dir }
+            elseif ($old.EndsWith(';')) { $new = "$old$Dir;" }
+            else { $new = "$old;$Dir" }
+        } elseif ($kept.Count -eq $parts.Count) {
             return $false
+        } else {
+            $new = $kept -join ';'
         }
-        $key.SetValue('Path', ($kept -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
         return $true
     } finally {
         $key.Close()

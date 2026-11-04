@@ -198,50 +198,59 @@ begin
   Result := Lowercase(RemoveBackslashUnlessRoot(Trim(Dir)));
 end;
 
-{ Rebuilds the user PATH without Dir, then appends it again when Add is set,
-  so repeated installs never duplicate the entry. Keeps the value
-  REG_EXPAND_SZ, which Windows uses for the user PATH. }
+{ Removes Dir from the user PATH, or appends it when Add is set and it is not
+  there yet, so repeated installs never duplicate the entry. The rest of the
+  PATH is kept character for character, empty entries and a trailing ';'
+  included: other tools append 'dir;' on the assumption that the PATH ends in
+  ';' (the stock user PATH does), and uninstall gives back exactly what install
+  found. Keeps the value REG_EXPAND_SZ, which Windows uses for the user PATH.
+  install.ps1's Update-UserPath does the same. }
 procedure UpdateUserPath(Dir: String; Add: Boolean);
 var
   OldPath, NewPath, Rest, Item: String;
   P: Integer;
-  Changed: Boolean;
+  Changed, First, Last: Boolean;
 begin
   if not RegQueryStringValue(HKCU, EnvKey, 'Path', OldPath) then
     OldPath := '';
   NewPath := '';
   Changed := False;
+  First := True;
   Rest := OldPath;
-  while Rest <> '' do
-  begin
+  { repeat, not while: the piece after the last ';' counts too, even when empty }
+  repeat
     P := Pos(';', Rest);
-    if P = 0 then
-    begin
-      Item := Rest;
-      Rest := '';
-    end else
+    Last := P = 0;
+    if Last then
+      Item := Rest
+    else
     begin
       Item := Copy(Rest, 1, P - 1);
       Rest := Copy(Rest, P + 1, Length(Rest));
     end;
-    if Trim(Item) = '' then
-      Continue;
-    if NormalizeDir(Item) = NormalizeDir(Dir) then
+    if (Trim(Item) <> '') and (NormalizeDir(Item) = NormalizeDir(Dir)) then
     begin
       if Add then
         Exit; { already present: leave PATH untouched }
       Changed := True;
-      Continue;
+    end else
+    begin
+      if not First then
+        NewPath := NewPath + ';';
+      NewPath := NewPath + Item;
+      First := False;
     end;
-    if NewPath <> '' then
-      NewPath := NewPath + ';';
-    NewPath := NewPath + Item;
-  end;
+  until Last;
   if Add then
   begin
-    if NewPath <> '' then
-      NewPath := NewPath + ';';
-    NewPath := NewPath + Dir;
+    { Here NewPath = OldPath. Dir goes before a trailing ';', so the PATH
+      keeps ending in one and uninstall restores it exactly. }
+    if NewPath = '' then
+      NewPath := Dir
+    else if NewPath[Length(NewPath)] = ';' then
+      NewPath := NewPath + Dir + ';'
+    else
+      NewPath := NewPath + ';' + Dir;
     Changed := True;
   end;
   if Changed then
