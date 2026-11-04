@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,18 +77,48 @@ struct Entry {
     state: State,
     /// Last document generation that showed it.
     gen: u64,
+    /// Generation of the last layout job sent for it.
+    sent: u64,
     /// Last frame it was drawn in.
     drawn: u64,
 }
 
 enum Job {
-    Layout { key: Key, source: Arc<str> },
+    /// `gen` is the document generation it was asked for in.
+    Layout { key: Key, gen: u64, source: Arc<str> },
     Raster { key: Key, tree: Arc<usvg::Tree>, size: [usize; 2] },
 }
 
 enum Done {
     Layout { key: Key, result: Result<Arc<usvg::Tree>, String> },
     Raster { key: Key, image: ColorImage },
+    /// A layout that was not run because another document was opened after it was asked
+    /// for. The source comes back so that it can be sent again.
+    Skipped { key: Key, gen: u64, source: Arc<str> },
+}
+
+/// What [`Diagrams::poll`] does with a skipped layout.
+#[derive(Debug, PartialEq)]
+enum OnSkip {
+    /// The current document shows the diagram: lay it out after all.
+    Resend,
+    /// Only a document no longer shown did: forget it, so that it is not waited for.
+    Remove,
+    /// The entry has moved on (laid out, or asked for again since).
+    Ignore,
+}
+
+/// The fate of a layout asked for in generation `skipped` and skipped, for an entry that is
+/// `pending`, was last shown in generation `gen` and last sent in `sent`, while `current` is
+/// the generation shown now.
+fn on_skipped(pending: bool, gen: u64, sent: u64, skipped: u64, current: u64) -> OnSkip {
+    if !pending || sent != skipped {
+        OnSkip::Ignore
+    } else if gen >= current {
+        OnSkip::Resend
+    } else {
+        OnSkip::Remove
+    }
 }
 
 pub struct Diagrams {
@@ -96,6 +127,9 @@ pub struct Diagrams {
     rx: mpsc::Receiver<Done>,
     entries: HashMap<Key, Entry>,
     frame: u64,
+    /// The document generation shown now, shared with the worker so that it can skip the
+    /// layouts of documents no longer shown.
+    current: Arc<AtomicU64>,
 }
 
 impl Diagrams {
@@ -103,11 +137,13 @@ impl Diagrams {
         let (tx, worker_rx) = mpsc::channel();
         let (worker_tx, rx) = mpsc::channel();
         let worker_ctx = ctx.clone();
+        let current = Arc::new(AtomicU64::new(0));
+        let worker_current = current.clone();
         std::thread::Builder::new()
             .name("mermaid".into())
-            .spawn(move || worker(worker_rx, worker_tx, worker_ctx))
+            .spawn(move || worker(worker_rx, worker_tx, worker_ctx, worker_current))
             .expect("spawn mermaid thread");
-        Self { ctx, tx, rx, entries: HashMap::new(), frame: 0 }
+        Self { ctx, tx, rx, entries: HashMap::new(), frame: 0, current }
     }
 
     /// Takes in finished work. Call once per frame, before drawing.
@@ -115,6 +151,24 @@ impl Diagrams {
         self.frame += 1;
         while let Ok(done) = self.rx.try_recv() {
             match done {
+                Done::Skipped { key, gen, source } => {
+                    let current = self.current.load(Ordering::Relaxed);
+                    let Some(e) = self.entries.get_mut(&key) else { continue };
+                    // A diagram the current document still shows (a reload that left it
+                    // unchanged) is sent again rather than left to status(): after the first
+                    // frame of a document only the blocks in view ask for theirs, and the
+                    // others must still be laid out for the document's height to be known.
+                    match on_skipped(matches!(e.state, State::Pending), e.gen, e.sent, gen, current) {
+                        OnSkip::Resend => {
+                            e.sent = current;
+                            let _ = self.tx.send(Job::Layout { key, gen: current, source });
+                        }
+                        OnSkip::Remove => {
+                            self.entries.remove(&key);
+                        }
+                        OnSkip::Ignore => {}
+                    }
+                }
                 Done::Layout { key, result } => {
                     if let Some(e) = self.entries.get_mut(&key) {
                         e.state = match result {
@@ -169,8 +223,8 @@ impl Diagrams {
         source.hash(&mut h);
         let key = (h.finish(), dark);
         let entry = self.entries.entry(key).or_insert_with(|| {
-            let _ = self.tx.send(Job::Layout { key, source: source.clone() });
-            Entry { state: State::Pending, gen, drawn: 0 }
+            let _ = self.tx.send(Job::Layout { key, gen, source: source.clone() });
+            Entry { state: State::Pending, gen, sent: gen, drawn: 0 }
         });
         entry.gen = gen;
         match &entry.state {
@@ -205,16 +259,37 @@ impl Diagrams {
     }
 
     /// Forgets diagrams that neither this document nor the one before it showed, so a
-    /// reload keeps the ones that did not change.
+    /// reload keeps the ones that did not change, and tells the worker that layouts asked
+    /// for before `gen` are no longer needed.
     pub fn retain_generation(&mut self, gen: u64) {
         self.entries.retain(|_, e| e.gen + 1 >= gen);
+        self.current.store(gen, Ordering::Relaxed);
     }
 }
 
-fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
+/// A layout taken off the queue unrun: its key, generation and source.
+type SkippedLayout = (Key, u64, Arc<str>);
+
+/// Takes the job to run next off `queue`. Redraws come first: they are for diagrams on
+/// screen, while layouts are requested for the whole document so that its height is known.
+/// Layouts asked for before generation `current`, for a document no longer shown, are
+/// taken off into `skipped` instead of being run: one diagram can take seconds, and those
+/// of the document now shown would wait behind them.
+fn next_job(queue: &mut Vec<Job>, current: u64, skipped: &mut Vec<SkippedLayout>) -> Option<Job> {
+    for job in queue.extract_if(.., |j| matches!(j, Job::Layout { gen, .. } if *gen < current)) {
+        if let Job::Layout { key, gen, source } = job {
+            skipped.push((key, gen, source));
+        }
+    }
+    let next = queue.iter().position(|j| matches!(j, Job::Raster { .. })).unwrap_or(0);
+    (!queue.is_empty()).then(|| queue.remove(next))
+}
+
+fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context, current: Arc<AtomicU64>) {
     let mut renderers: [Option<Renderer>; 2] = [None, None];
     let mut fonts: Option<Fonts> = None;
     let mut queue: Vec<Job> = Vec::new();
+    let mut skipped = Vec::new();
     loop {
         if queue.is_empty() {
             match rx.recv() {
@@ -223,11 +298,19 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
             }
         }
         queue.extend(rx.try_iter());
-        // Redraws first: they are for diagrams on screen, while layouts are requested for
-        // the whole document so that its height is known.
-        let next = queue.iter().position(|j| matches!(j, Job::Raster { .. })).unwrap_or(0);
-        let done = match queue.remove(next) {
-            Job::Layout { key, source } => {
+        let next = next_job(&mut queue, current.load(Ordering::Relaxed), &mut skipped);
+        if !skipped.is_empty() {
+            log::debug!("skipped {} Mermaid layouts of a document no longer shown", skipped.len());
+            for (key, gen, source) in skipped.drain(..) {
+                if tx.send(Done::Skipped { key, gen, source }).is_err() {
+                    return;
+                }
+            }
+            ctx.request_repaint();
+        }
+        let Some(job) = next else { continue };
+        let done = match job {
+            Job::Layout { key, source, .. } => {
                 let t0 = Instant::now();
                 let dark = key.1;
                 let renderer = renderers[dark as usize].get_or_insert_with(|| {
@@ -519,6 +602,64 @@ mod tests {
             assert!(tw <= 32768 && th <= 32768);
             assert!((tw as f32 / th as f32 - w / h).abs() < 0.01 * w / h, "{w}x{h} -> {tw}x{th}");
         }
+    }
+
+    fn layout(n: u64, gen: u64) -> Job {
+        Job::Layout { key: (n, false), gen, source: Arc::from("graph TD; a-->b") }
+    }
+
+    fn raster(n: u64) -> Job {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+        let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).unwrap();
+        Job::Raster { key: (n, false), tree: Arc::new(tree), size: [1, 1] }
+    }
+
+    /// The jobs `next_job` hands out until the queue is empty, as (kind, key), and the
+    /// skipped layouts as (key, gen).
+    fn run(mut queue: Vec<Job>, current: u64) -> (Vec<(&'static str, u64)>, Vec<(u64, u64)>) {
+        let (mut ran, mut skipped) = (Vec::new(), Vec::new());
+        while let Some(job) = next_job(&mut queue, current, &mut skipped) {
+            ran.push(match job {
+                Job::Layout { key, .. } => ("layout", key.0),
+                Job::Raster { key, .. } => ("raster", key.0),
+            });
+        }
+        (ran, skipped.into_iter().map(|(key, gen, _)| (key.0, gen)).collect())
+    }
+
+    #[test]
+    fn next_job_skips_layouts_of_documents_no_longer_shown() {
+        let (ran, skipped) = run(vec![layout(1, 1), layout(2, 2), layout(3, 1), layout(4, 2)], 2);
+        assert_eq!(ran, [("layout", 2), ("layout", 4)]);
+        assert_eq!(skipped, [(1, 1), (3, 1)]);
+        // Only layouts are skipped: a redraw is for a diagram on screen, whatever generation asked for it.
+        let (ran, skipped) = run(vec![layout(1, 1), raster(2), layout(3, 2)], 2);
+        assert_eq!(ran, [("raster", 2), ("layout", 3)]);
+        assert_eq!(skipped, [(1, 1)]);
+        // A queue of only stale layouts runs nothing.
+        let (ran, skipped) = run(vec![layout(1, 1)], 2);
+        assert!(ran.is_empty());
+        assert_eq!(skipped, [(1, 1)]);
+    }
+
+    #[test]
+    fn next_job_runs_redraws_first_then_layouts_in_order() {
+        let (ran, skipped) = run(vec![layout(1, 1), layout(2, 1), raster(3), layout(4, 1), raster(5)], 1);
+        assert_eq!(ran, [("raster", 3), ("raster", 5), ("layout", 1), ("layout", 2), ("layout", 4)]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn skipped_layouts_are_sent_again_only_for_the_document_shown() {
+        // Reloaded unchanged (shown in generation 3, current 3), last sent in 2: lay it out.
+        assert_eq!(on_skipped(true, 3, 2, 2, 3), OnSkip::Resend);
+        // Skipped before the new document's first frame: removed, and that frame asks again.
+        assert_eq!(on_skipped(true, 2, 2, 2, 3), OnSkip::Remove);
+        // Only the document before showed it.
+        assert_eq!(on_skipped(true, 1, 1, 1, 3), OnSkip::Remove);
+        // Laid out or failed meanwhile, or sent again since: a stale reply.
+        assert_eq!(on_skipped(false, 3, 2, 2, 3), OnSkip::Ignore);
+        assert_eq!(on_skipped(true, 3, 3, 2, 3), OnSkip::Ignore);
     }
 
     #[test]
