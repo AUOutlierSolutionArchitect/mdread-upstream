@@ -433,7 +433,23 @@ impl Fonts {
         Self { db: Arc::new(db), system, missing: Mutex::new(HashSet::new()), environment }
     }
 
+    /// Loads a font for each character of `svg` that the loaded fonts lack. usvg asks the
+    /// fallback for a text's first missing character only, so when that one cannot be
+    /// drawn the fonts for the characters after it must be loaded already (see
+    /// `load_fallback`). Loading them up front is no more work than loading them on demand.
+    fn preload(&mut self, svg: &str) {
+        let mut chars: Vec<char> = svg_chars(svg).filter(|c| !c.is_ascii()).collect();
+        chars.sort_unstable();
+        chars.dedup();
+        for c in chars {
+            if !self.db.faces().any(|f| has_char(&self.db, f.id, c)) {
+                load_fallback(&self.system, &self.missing, c, &[], &mut self.db);
+            }
+        }
+    }
+
     fn parse(&mut self, svg: &str) -> Result<usvg::Tree, usvg::Error> {
+        self.preload(svg);
         let (system, missing) = (&self.system, &self.missing);
         let loaded = usvg::FontResolver::default_fallback_selector();
         let mut opt = usvg::Options { fontdb: self.db.clone(), ..Default::default() };
@@ -546,10 +562,7 @@ fn load_fallback(
         return None;
     }
     let regular = |f: &&fontdb::FaceInfo| f.style == fontdb::Style::Normal && f.weight == fontdb::Weight::NORMAL;
-    let has = |f: &&fontdb::FaceInfo| {
-        let glyph = system.with_face_data(f.id, |data, index| ttf_parser::Face::parse(data, index).ok()?.glyph_index(c));
-        matches!(glyph, Some(Some(_)))
-    };
+    let has = |f: &&fontdb::FaceInfo| has_char(system, f.id, c);
     let Some(face) = system.faces().filter(regular).find(has).or_else(|| system.faces().find(has)) else {
         missing.insert(c);
         return None;
@@ -558,18 +571,49 @@ fn load_fallback(
     // usvg asks for the first character of a cluster as long as any glyph in it is missing,
     // so a mark that no font has after a letter ("a\u{20D7}", or the U+20E3 of a keycap
     // emoji) asks for the letter again and again. Loading the same file under a new ID each
-    // time would never end, so a face that is already loaded is not loaded again, and once
-    // this text was shaped with it None ends the fallback for the whole text: the mark, and
-    // anything after it that needs another font, is left undrawn. `c` itself is not missing.
-    let copies: Vec<fontdb::ID> = db.faces().filter(|f| f.index == face.index && face_path(f) == Some(path)).map(|f| f.id).collect();
-    if !copies.is_empty() {
-        return copies.into_iter().find(|id| !used.contains(id));
+    // time would never end, so a face that is already loaded is not loaded again. Once this
+    // text was shaped with it, the letter's cluster cannot be completed, and None would end
+    // the fallback for the whole text, leaving anything after the mark that needs another
+    // font undrawn. So each loaded face not tried yet is offered instead (Fonts::preload has
+    // loaded those the text needs), and None only once they all were. `c` is not missing.
+    if db.faces().any(|f| f.index == face.index && face_path(f) == Some(path)) {
+        let copy = db.faces().find(|f| f.index == face.index && face_path(f) == Some(path) && !used.contains(&f.id));
+        return copy.map(|f| f.id).or_else(|| untried_face(db, used));
     }
     let db = Arc::make_mut(db);
     let before: HashSet<fontdb::ID> = db.faces().map(|f| f.id).collect();
     db.load_font_file(path).ok()?;
     log::debug!("diagram text: {c:?} from {}", face.post_script_name);
     db.faces().find(|f| !before.contains(&f.id) && f.index == face.index).map(|f| f.id)
+}
+
+/// Whether face `id` in `db` has a glyph for `c`.
+fn has_char(db: &fontdb::Database, id: fontdb::ID, c: char) -> bool {
+    let glyph = db.with_face_data(id, |data, index| ttf_parser::Face::parse(data, index).ok()?.glyph_index(c));
+    matches!(glyph, Some(Some(_)))
+}
+
+/// A face in `db` that neither is one of `used` nor comes from the same file as one.
+fn untried_face(db: &fontdb::Database, used: &[fontdb::ID]) -> Option<fontdb::ID> {
+    let tried: Vec<_> = used.iter().filter_map(|id| db.face(*id)).map(|f| (face_path(f), f.index)).collect();
+    db.faces().find(|f| !used.contains(&f.id) && !tried.contains(&(face_path(f), f.index))).map(|f| f.id)
+}
+
+/// The characters of `svg`, with numeric character references decoded.
+fn svg_chars(svg: &str) -> impl Iterator<Item = char> + '_ {
+    svg.split("&#").enumerate().flat_map(|(i, part)| {
+        let reference = (i > 0).then(|| part.split_once(';')).flatten().and_then(|(num, rest)| {
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse().ok()?,
+            };
+            Some((char::from_u32(code)?, rest))
+        });
+        match reference {
+            Some((c, rest)) => Some(c).into_iter().chain(rest.chars()),
+            None => None.into_iter().chain(part.chars()),
+        }
+    })
 }
 
 fn face_path(face: &fontdb::FaceInfo) -> Option<&Path> {
@@ -668,14 +712,20 @@ mod tests {
         assert_eq!(on_skipped(true, 3, 3, 2, 3), OnSkip::Ignore);
     }
 
-    #[test]
-    fn fallback_for_a_mark_no_font_has_ends() {
-        // egui's Ubuntu Light as the only installed font, so the test does not depend on the
-        // machine's fonts. It has 'a' but not U+20D7, the combining arrow above.
-        let dir = std::env::temp_dir().join(format!("mdread-fallback-test-{}", std::process::id()));
+    /// Fonts loaded, glyphs as (text, font name), and whether 'a' was taken for missing.
+    type Shaped = (usize, Vec<(String, String)>, bool);
+
+    /// Parses `text` as an SVG label with egui's Ubuntu Light as the sans-serif font and
+    /// egui's `extra` fonts as the only other installed ones, so the result does not depend
+    /// on the machine's fonts. Returns the fonts loaded, each glyph's text and the name of
+    /// the font it was drawn with ("" for none), and whether 'a' was taken for missing.
+    fn shape_label(test: &str, extra: &[&str], text: &str) -> Shaped {
+        let dir = std::env::temp_dir().join(format!("mdread-fallback-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let defs = egui::FontDefinitions::default();
-        std::fs::write(dir.join("Ubuntu-Light.ttf"), (*defs.font_data["Ubuntu-Light"].font).as_ref()).unwrap();
+        for name in ["Ubuntu-Light"].iter().chain(extra) {
+            std::fs::write(dir.join(format!("{name}.ttf")), (*defs.font_data[*name].font).as_ref()).unwrap();
+        }
         let mut system = fontdb::Database::new();
         system.load_fonts_dir(&dir);
         let mut db = fontdb::Database::new();
@@ -683,18 +733,48 @@ mod tests {
         db.set_sans_serif_family(sans.as_str());
         db.set_serif_family(sans.as_str());
         let mut fonts = Fonts { db: Arc::new(db), system, missing: Mutex::default(), environment: SvgEnvironment::deterministic() };
-        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text x="10" y="30" font-family="&quot;trebuchet ms&quot;, sans-serif">a&#x20D7;</text></svg>"#;
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text x="10" y="30" font-family="&quot;trebuchet ms&quot;, sans-serif">{text}</text></svg>"#
+        );
         // On a thread, so that a loop fails the test instead of hanging it.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let faces = fonts.parse(svg).map(|tree| tree.fontdb().len());
-            let _ = tx.send((faces, fonts.missing.lock().unwrap().contains(&'a')));
+            let tree = fonts.parse(&svg).expect("the SVG parses");
+            let mut glyphs = Vec::new();
+            for node in tree.root().children() {
+                let usvg::Node::Text(t) = node else { continue };
+                for g in t.layouted().iter().flat_map(|span| &span.positioned_glyphs) {
+                    let font = match g.id.0 {
+                        0 => String::new(),
+                        _ => tree.fontdb().face(g.font).map(|f| f.families[0].0.clone()).unwrap_or_default(),
+                    };
+                    glyphs.push((g.text.clone(), font));
+                }
+            }
+            let _ = tx.send((tree.fontdb().len(), glyphs, fonts.missing.lock().unwrap().contains(&'a')));
         });
         let result = rx.recv_timeout(Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
-        let (faces, missing) = result.expect("font fallback did not end");
+        result.expect("font fallback did not end")
+    }
+
+    #[test]
+    fn fallback_for_a_mark_no_font_has_ends() {
+        // Ubuntu Light has 'a' but not U+20D7, the combining arrow above, and no other font does.
+        let (faces, _, missing) = shape_label("mark", &[], "a&#x20D7;");
         // The font it was drawn with is not loaded again, and 'a' is not taken for a character no font has.
-        assert_eq!(faces.expect("the SVG parses"), 1);
+        assert_eq!(faces, 1);
         assert!(!missing);
+    }
+
+    #[test]
+    fn text_after_a_mark_no_font_has_still_falls_back() {
+        // Noto Emoji has U+1F600 but not 'a'. usvg asks for 'a' while its arrow is missing,
+        // and the emoji after it must still get its font.
+        let (faces, glyphs, missing) = shape_label("after-mark", &["NotoEmoji-Regular"], "a&#x20D7; &#x1F600;");
+        assert_eq!(faces, 2);
+        assert!(!missing);
+        let emoji = glyphs.iter().find(|(text, _)| text == "\u{1F600}").expect("the emoji is laid out");
+        assert!(emoji.1.contains("Emoji"), "the emoji is drawn with {:?}", emoji.1);
     }
 }

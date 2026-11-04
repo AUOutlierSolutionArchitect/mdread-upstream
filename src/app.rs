@@ -1928,8 +1928,9 @@ impl App {
             // it are measured. eframe captures the frame painted after the request, and
             // this runs at the end of the frame, after show_content queued this frame's
             // work, so one settled frame is enough. Without a document nothing is loading.
-            let images_loading = self.doc.is_some() && self.measures.iter().any(|m| m.pending);
-            let settled = !self.diagrams.busy() && !self.hl.busy() && !images_loading && self.jump.is_none() && self.pending_offset.is_none();
+            // A block's pending flag covers its diagrams as well as its images.
+            let blocks_loading = self.doc.is_some() && self.measures.iter().any(|m| m.pending);
+            let settled = !self.diagrams.busy() && !self.hl.busy() && !blocks_loading && self.jump.is_none() && self.pending_offset.is_none();
             if self.screenshot_taken.is_none() && screenshot_due(self.started.elapsed(), Duration::from_millis(self.screenshot_delay_ms), settled) {
                 if !settled {
                     log::warn!("taking the screenshot before the page has finished drawing");
