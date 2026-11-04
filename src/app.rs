@@ -265,6 +265,8 @@ pub struct App {
     screenshot_delay_ms: u64,
     /// Where the screenshot lands once requested and taken.
     screenshot_taken: Option<Arc<egui::mutex::Mutex<Option<Arc<egui::ColorImage>>>>>,
+    /// The screenshot was requested at the wait limit, before the page had finished drawing.
+    screenshot_unsettled: bool,
     /// Whether the title bar was last made dark (Windows; None before the first frame).
     #[cfg(windows)]
     title_bar_dark: Option<bool>,
@@ -394,6 +396,7 @@ impl App {
             screenshot: args.screenshot.clone(),
             screenshot_delay_ms: args.screenshot_delay_ms,
             screenshot_taken: None,
+            screenshot_unsettled: false,
             #[cfg(windows)]
             title_bar_dark: None,
         };
@@ -1909,13 +1912,29 @@ impl App {
         if let Some(img) = shot {
             let [w, h] = img.size;
             crate::cli_console(true);
+            if self.screenshot_unsettled {
+                eprintln!("screenshot taken before the page had finished drawing ({} s past the delay)", SCREENSHOT_WAIT_MAX.as_secs());
+            }
             match image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => eprintln!("screenshot saved to {} ({w}x{h})", path.display()),
                 Err(e) => eprintln!("screenshot failed: {e}"),
             }
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
-            if self.screenshot_taken.is_none() && self.started.elapsed() >= Duration::from_millis(self.screenshot_delay_ms) {
+            // Diagrams are laid out and drawn, and code highlighted, on worker threads, and
+            // images read on egui's loader thread (a block that drew one still loading is
+            // re-measured every frame until it arrives, so its flag clears then); a jump to
+            // an anchor or a restored scroll position moves the page once the blocks above
+            // it are measured. eframe captures the frame painted after the request, and
+            // this runs at the end of the frame, after show_content queued this frame's
+            // work, so one settled frame is enough. Without a document nothing is loading.
+            let images_loading = self.doc.is_some() && self.measures.iter().any(|m| m.pending);
+            let settled = !self.diagrams.busy() && !self.hl.busy() && !images_loading && self.jump.is_none() && self.pending_offset.is_none();
+            if self.screenshot_taken.is_none() && screenshot_due(self.started.elapsed(), Duration::from_millis(self.screenshot_delay_ms), settled) {
+                if !settled {
+                    log::warn!("taking the screenshot before the page has finished drawing");
+                    self.screenshot_unsettled = true;
+                }
                 let taken = Arc::new(egui::mutex::Mutex::new(None));
                 self.screenshot_taken = Some(taken.clone());
                 log::debug!("requesting screenshot at frame {}", self.frames);
@@ -1946,6 +1965,18 @@ impl App {
     }
 }
 
+/// How long `--screenshot` waits past its delay for diagrams, images and highlighting. It
+/// must not wait for ever: the 10 s layout limit is per diagram and the worker lays them
+/// out one at a time, so a page with several slow ones takes a multiple of it, a worker
+/// that died leaves its diagrams pending for good, and a remote image can be slow.
+const SCREENSHOT_WAIT_MAX: Duration = Duration::from_secs(20);
+
+/// Whether to take the `--screenshot` now, `elapsed` after launch: once the `delay` has
+/// passed and the page is `settled`, or `SCREENSHOT_WAIT_MAX` after the delay regardless.
+fn screenshot_due(elapsed: Duration, delay: Duration, settled: bool) -> bool {
+    elapsed >= delay && (settled || elapsed >= delay + SCREENSHOT_WAIT_MAX)
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1959,7 +1990,6 @@ impl eframe::App for App {
         self.add_ui_script_fallbacks(&ctx);
         #[cfg(windows)]
         self.sync_title_bar(frame);
-        self.handle_screenshot(&ctx);
 
         self.show_status_bar(ui);
         if self.search.open {
@@ -1979,6 +2009,8 @@ impl eframe::App for App {
             });
         self.show_context_menu(&ctx);
         self.show_help(&ctx);
+        // Last, so that it sees the diagram drawing and highlighting show_content asked for.
+        self.handle_screenshot(&ctx);
         log::trace!(
             "frame {} at {:.0} ms took {:.2} ms",
             self.frames,
@@ -2352,6 +2384,19 @@ mod tests {
     } else {
         Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
     };
+
+    #[test]
+    fn screenshot_waits_for_the_delay_then_for_the_page_to_settle() {
+        let ms = Duration::from_millis;
+        let delay = ms(1500);
+        // The delay is a minimum, even when there is nothing to wait for.
+        assert!(!screenshot_due(ms(1499), delay, true));
+        assert!(screenshot_due(delay, delay, true));
+        // After it, a page still drawing diagrams, images or highlighting is waited for...
+        assert!(!screenshot_due(delay + SCREENSHOT_WAIT_MAX - ms(1), delay, false));
+        // ...but not forever.
+        assert!(screenshot_due(delay + SCREENSHOT_WAIT_MAX, delay, false));
+    }
 
     #[test]
     fn width_buttons_step_through_presets() {

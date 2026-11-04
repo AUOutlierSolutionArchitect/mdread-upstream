@@ -109,6 +109,11 @@ impl Highlighter {
         None
     }
 
+    /// Whether any code block is still waiting for its colours.
+    pub fn busy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Forget results for older documents.
     pub fn retain_generation(&mut self, gen: u64) {
         self.cache.retain(|k, _| k.0 == gen);
@@ -191,4 +196,33 @@ fn highlight(code: &str, lang: Option<&str>, dark: bool) -> Highlighted {
         }
     }
     Highlighted { spans }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn busy_until_the_worker_answers_or_the_generation_is_dropped() {
+        let mut hl = Highlighter::new(egui::Context::default());
+        let code: Arc<str> = Arc::from("fn main() {}\n");
+        assert!(!hl.busy());
+        assert!(hl.get(1, 0, false, &code, Some("rust")).is_none());
+        assert!(hl.busy());
+        // The first request waits for the syntax set to load.
+        let until = Instant::now() + Duration::from_secs(60);
+        while hl.get(1, 0, false, &code, Some("rust")).is_none() {
+            assert!(hl.busy());
+            assert!(Instant::now() < until, "no highlighting within 60 s");
+            std::thread::sleep(Duration::from_millis(10));
+            hl.poll();
+        }
+        assert!(!hl.busy());
+        // A request for a document no longer shown does not keep it busy.
+        assert!(hl.get(1, 1, false, &code, Some("rust")).is_none());
+        assert!(hl.busy());
+        hl.retain_generation(2);
+        assert!(!hl.busy());
+    }
 }

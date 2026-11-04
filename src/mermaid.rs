@@ -257,6 +257,13 @@ impl Diagrams {
         self.entries.values().any(|e| matches!(e.state, State::Pending))
     }
 
+    /// Whether any diagram is still being laid out or drawn, so a screenshot would miss it.
+    /// Diagrams that failed are done; those laid out but far from view are never drawn,
+    /// so only the drawing asked for counts.
+    pub fn busy(&self) -> bool {
+        self.entries.values().any(|e| matches!(e.state, State::Pending | State::Ready { rastering: true, .. }))
+    }
+
     /// Forgets diagrams that neither this document nor the one before it showed, so a
     /// reload keeps the ones that did not change, and tells the worker that layouts asked
     /// for before `gen` are no longer needed.
