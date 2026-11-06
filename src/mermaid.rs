@@ -252,11 +252,6 @@ impl Diagrams {
         texture.as_ref().map(TextureHandle::id)
     }
 
-    /// Whether any diagram is still being laid out, so its height is not known yet.
-    pub fn laying_out(&self) -> bool {
-        self.entries.values().any(|e| matches!(e.state, State::Pending))
-    }
-
     /// Whether any diagram is still being laid out or drawn, so a screenshot would miss it.
     /// Diagrams that failed are done; those laid out but far from view are never drawn,
     /// so only the drawing asked for counts.
