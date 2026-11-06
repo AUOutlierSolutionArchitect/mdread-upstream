@@ -2347,8 +2347,8 @@ fn scroll_target(requested: f32, content_h: f32, measured_this_doc: bool) -> Opt
 }
 
 /// Whether a block is laid out this frame rather than given its last measured (or estimated)
-/// height: it is near the view, every block is being measured, it is held (a jump or a
-/// restored place keeps it in the view), it is the last block and has never been measured,
+/// height: it is near the view, every block is being measured, it is the place this pass keeps
+/// (a jump, a restored place, or last frame's top block), it is the last block and has never been measured,
 /// or an image or diagram in it was still loading when it was. Every block is measured on a
 /// document's first frame only, when its images are still being read on egui's loader
 /// thread; without the pending case, one off screen would keep its 24 px placeholder height,
@@ -2496,8 +2496,13 @@ struct FrameIn {
 /// What one pass hands from `Anchor::before` and the column to `Anchor::after`. `before` resets it at
 /// the start of every pass.
 struct AnchorPass {
+    /// A `pending_offset` was placed this pass.
+    placed: bool,
     /// The entry this pass keeps, with the `rel` it is drawn at (`clamp_rel` applied).
     held: Option<(usize, f32)>,
+    /// The entry this pass keeps with its stored `rel`, and whether its block was measured and at
+    /// least as deep as the place when the pass started.
+    entry: Option<(usize, f32, bool)>,
     /// `(block, rel, old height)` of the held place inside a block above the view, noted in `before` on a relayout.
     rescale: Option<(usize, f32, f32)>,
     /// The content Ui's clip top, read first in the column.
@@ -2520,27 +2525,29 @@ struct AnchorPass {
 /// Written by hand: emath's `Rect` has no `Default`. `column` sets `clip` before `at_block` reads it.
 impl Default for AnchorPass {
     fn default() -> Self {
-        Self { held: None, rescale: None, view_top: 0.0, clip: Rect::NOTHING, gap: 0.0, d: 0.0, page_end: 0.0, round: 0.0 }
+        Self { placed: false, held: None, entry: None, rescale: None, view_top: 0.0, clip: Rect::NOTHING, gap: 0.0, d: 0.0, page_end: 0.0, round: 0.0 }
     }
 }
 
 // egui internals this relies on (recheck after an egui upgrade): the content origin is fixed from the
-// offset before physics and the key-scroll target step (no test here pins it); `vertical_scroll_offset`
-// leaves the key-scroll target alone (no test pins it: if egui cleared the target, the gate would only
-// wait longer than needed); that target lives at most `duration.max`
-// (a_hold_survives_blocks_above_shrinking_by_more_than_a_screen fails if it lives longer); `content_size`
-// is the content Ui's `min_size` (no test here pins it). With the rubber band off, `end()` clamps an
-// out-of-range offset with this frame's bounds: back_lands_where_it_left_even_from_a_scrollable_page and
-// a_restored_place_deeper_than_its_block (i) fail if it does not. The content Ui's `max_rect().top()`,
-// read in `column`, is egui's pixel-rounded content origin, which holds while the scroll area's
-// `content_margin` is zero (a top margin would move jump holds by the margin), and the content clip top
-// is the scroll area's `inner_rect` top. The correction does not depend on that clip top (it cancels out
-// through `round`), but the clip of the blocks above and `view` do.
+// offset before physics and the key-scroll target step (key_scroll_at_the_end_with_growth_above_stays_at_the_end
+// and a_column_width_change_keeps_a_tall_top_block fail if it is not); `vertical_scroll_offset` leaves
+// the key-scroll target alone (no test pins it: if egui cleared the target, the gate would only wait
+// longer than needed); that target lives at most `duration.max` (key_scroll_ends_where_it_would_without_growth
+// and a_hold_survives_blocks_above_shrinking_by_more_than_a_screen fail if it lives longer); `content_size`
+// is the content Ui's `min_size` (key_scroll_at_the_end_with_growth_above_stays_at_the_end, its page
+// length). With the rubber band off, `end()` clamps an out-of-range offset with this frame's bounds:
+// back_lands_where_it_left_even_from_a_scrollable_page and a_restored_place_deeper_than_its_block (i) fail
+// if it does not. The content Ui's `max_rect().top()`, read in `column`, is egui's pixel-rounded content
+// origin, which holds while the scroll area's `content_margin` is zero (a top margin would move jump holds
+// by the margin), and the content clip top is the scroll area's `inner_rect` top. The correction does not
+// depend on that clip top (it cancels out through `round`), but the clip of the blocks above and `view` do.
 /// The reader's place, kept as a block and how far its top is below the top of the view, so content
 /// that changes height above the view (a diagram or image finishing, a relayout) does not move what
-/// is being read. A jump or a restored position becomes a hold; the column draws the held block where
-/// the hold says by moving the content before it in the same pass, and the difference is carried as
-/// `shift` until no egui animation can be running.
+/// is being read. A jump or a restored position becomes a hold; with no hold, ordinary reading keeps
+/// last frame's top block the same way. The column draws the kept block at its `rel` by moving the
+/// content before it in the same pass, and the difference is carried as `shift` until no egui
+/// animation can be running.
 ///
 /// Each frame `show_content` calls `before` (the offset to place, the shift to move in, the place to
 /// keep this pass), then `column` inside `show_viewport`, whose body calls `at_block` at the top of
@@ -2562,7 +2569,7 @@ struct Anchor {
     /// egui's offset. The true offset is `scroll_offset + shift`.
     shift: f32,
     /// The block at the top of the view and its `rel`, as of the end of the last frame, adjusted for
-    /// the movement egui applied. `place` reads it.
+    /// the movement egui applied. With no hold, `before` keeps it (ordinary reading); `place` reads it.
     view: Option<(usize, f32)>,
     /// Screen y of the page end as drawn this frame (the content Ui's cursor top after the closing
     /// space, which is the end egui clamps to), kept for `jump`.
@@ -2579,6 +2586,9 @@ struct Anchor {
     cap_logged: bool,
     /// Last frame's `ui.available_width()`, to tell a relayout.
     avail_w: f32,
+    /// `view` is a place kept inside a block that shrank under it while loading again: `before`
+    /// draws it about a line inside the block, as a restored hold, until the block is laid out.
+    view_kept: bool,
     /// Values one pass hands from `before` and the column to `after`.
     pass: AnchorPass,
 }
@@ -2598,6 +2608,7 @@ impl Anchor {
                 Some(y) => {
                     sa = set_scroll(ui, sa, y, !f.same_doc || self.shift != 0.0);
                     self.shift = 0.0;
+                    self.pass.placed = true;
                 }
                 None => {
                     *pending_offset = Some(off);
@@ -2616,7 +2627,9 @@ impl Anchor {
         // key change. Read before the caller's `layout_key` branch clears `measured`.
         let relayout = f.key_changed || f.avail_w != self.avail_w;
         self.avail_w = f.avail_w;
-        let entry = self.hold.filter(|&(b, _)| b < f.n);
+        // With no hold, last frame's top block is kept too. A placed `pending_offset` (Home, End, a
+        // load) is a new position, not one to keep.
+        let entry = self.hold.or(if self.pass.placed { None } else { self.view }).filter(|&(b, _)| b < f.n);
         if let Some((b, rel)) = entry {
             // Note the place inside a block that starts above the view, with the height it had, so
             // `after` can keep it in proportion once the block is laid out at the new width. Only a
@@ -2624,21 +2637,28 @@ impl Anchor {
             // or a height from an earlier width). A restored place still waiting for its block to
             // settle refers to the height it was saved with, not this one, so it is left to that.
             let m = measures.get(b).copied().unwrap_or_default();
-            if relayout && rel < 0.0 && m.measured && m.height > 0.0 && self.hold_h.is_none() {
+            let waiting = if self.hold.is_some() { self.hold_h.is_some() } else { self.view_kept };
+            if relayout && rel < 0.0 && m.measured && m.height > 0.0 && !waiting {
                 self.pass.rescale = Some((b, rel, m.height));
             }
-            // A place deeper than its block is now (a restore onto a diagram back at its
+            // A held place deeper than its block is now (a restore onto a diagram back at its
             // placeholder, or onto a block a width change shortened) is drawn about a line inside
-            // the block; the stored `rel` stays for when the block regains its height. A block not
-            // measured yet is drawn as stored, and `after` discards the pass if that was wrong.
-            let mut drawn = if m.measured { clamp_rel(rel, m.height, f.base) } else { rel };
+            // the block; the stored `rel` stays for when the block regains its height. So is a
+            // `view` kept in a block that shrank under it (`view_kept`). Any other `view` is drawn
+            // where egui left it: it is deeper than its block only below the last block, in the
+            // bottom padding (`block_at` counts it as part of that block), and a clamp there would
+            // pull the content down, as after End. A block not measured yet is drawn as stored, and
+            // `after` discards the pass if that was wrong.
+            let kept = self.hold.is_some() || self.view_kept;
+            let mut drawn = if m.measured && kept { clamp_rel(rel, m.height, f.base) } else { rel };
             // Near the page end, while the clamp is in effect, no higher than the end allows.
-            if let Some((fb, need)) = self.end_floor {
+            if let Some((fb, need)) = self.end_floor.filter(|_| self.hold.is_some()) {
                 if fb == b && drawn != rel {
                     drawn = drawn.max(need);
                 }
             }
             self.pass.held = Some((b, drawn));
+            self.pass.entry = Some((b, rel, m.measured && m.height >= -rel));
         }
         sa
     }
@@ -2779,17 +2799,42 @@ impl Anchor {
         self.view = block_at(block_tops, inner.top() + moved + self.pass.round);
         // egui's end clamp is not a movement to take off a place: the end is handled by `need`.
         let m = if end_clamp(painted, after, max) { 0.0 } else { moved };
+        // With no hold, a block that shrank under the place while loading again (a diagram redrawn
+        // for a new theme shows its short placeholder): `block_at` names a later block, and the
+        // place would stay on that one when the diagram regains its height, past it for good.
+        // Keep the stored place instead, drawn about a line inside the block while it is short, as
+        // a restored hold is, and discard the pass when it is drawn elsewhere next pass.
+        let was_kept = std::mem::take(&mut self.view_kept);
+        if let Some((b, rel, fit)) = self.pass.entry.filter(|_| self.hold.is_none() && !user) {
+            if let Some(mb) = measures.get(b).filter(|mb| mb.measured) {
+                if was_kept || (fit && mb.pending && mb.height < -rel) {
+                    let r = rel - m;
+                    self.view = Some((b, r));
+                    self.view_kept = mb.pending && mb.height < -r;
+                    let want = if self.view_kept { clamp_rel(r, mb.height, base) } else { r };
+                    let drawn = self.pass.held.map_or(rel, |(_, d)| d) - m;
+                    if (want - drawn).abs() >= 0.5 {
+                        ctx.request_discard("view: the kept place is drawn elsewhere next pass");
+                    }
+                }
+            }
+        }
         // A relayout changed the height of the block the place is inside: the stored `rel` alone
         // would put a reader 800 pt into a 1,200 pt diagram that halves 200 pt below it. Keep the
-        // same proportion of block `b` above the view: store it in place of what the re-base just
-        // stored (after a halve, a later block), and discard this pass so the shown one is drawn
-        // there. Not after the reader scrolled: the hold is gone and `view` follows them.
+        // same proportion of block `b` above the view: store it in place of what the re-base (or,
+        // with no hold, `block_at`) just stored (after a halve, a later block), and discard this pass
+        // so the shown one is drawn there. Not after the reader scrolled: the hold is gone and `view`
+        // follows them.
         let mut rescaled = false;
         if let Some((b, rel, h_old)) = self.pass.rescale.filter(|_| !user) {
             if let (Some(&top), Some(mb)) = (block_tops.get(b), measures.get(b)) {
                 let need = inner.height() - (page_end_now - top);
                 if let Some(r) = rescale_rel(rel, h_old, mb.height, m, base, need) {
-                    self.hold = Some((b, r));
+                    if self.hold.is_some() {
+                        self.hold = Some((b, r));
+                    } else {
+                        self.view = Some((b, r));
+                    }
                     self.hold_h = None;
                     rescaled = true;
                     ctx.request_discard("relayout: keep the place in the top block");
@@ -2901,6 +2946,7 @@ impl Anchor {
         self.clear_hold();
         self.shift = 0.0;
         self.view = None;
+        self.view_kept = false;
     }
 }
 
@@ -3331,6 +3377,47 @@ mod tests {
     }
 
     #[test]
+    fn real_app_reading_position_stays_across_a_slow_image() {
+        let dir = std::env::temp_dir().join(format!("mdread-rt-keyscroll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("page.md");
+        std::fs::write(&page, slow_image_page(SlowLoader::URIS[0])).unwrap();
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args::default());
+        let ready = [Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))];
+        ctx.add_image_loader(Arc::new(SlowLoader { ready: ready.clone() }));
+        let mut time = 0.0;
+        assert!(app.load_path(page, true, &ctx));
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |_| {});
+        // PageDown at f10, f20 and f30, through `key_commands`, each released in the next frame.
+        let page_down = |pressed| Event::Key { key: Key::PageDown, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+        for _ in 0..3 {
+            app_frames(&mut app, &ctx, &mut time, 1, vec![page_down(true)], |_| {});
+            app_frames(&mut app, &ctx, &mut time, 9, vec![page_down(false)], |_| {});
+        }
+        // 20 frames after the last press, past the key ease's 0.3 s: nothing moves any more.
+        app_frames(&mut app, &ctx, &mut time, 11, vec![], |_| {});
+        assert!(app.anchor.shift == 0.0, "at rest before the flip: shift {}", app.anchor.shift);
+        let (b, before) = block_at(&app.block_tops, app.content_rect.top()).expect("a block at the view top");
+        assert!(b > 0, "the view is still on the image: block {b}");
+        assert!(app.measures[0].pending, "the image is still loading before the flip");
+        let h0 = app.measures[0].height;
+        ready[0].store(true, Ordering::Relaxed);
+        let mut f = 0;
+        app_frames(&mut app, &ctx, &mut time, 30, vec![], |app| {
+            let grew = app.measures[0].height - h0;
+            assert!(grew > app.viewport_h, "f{f}: the image grew by {grew}, not more than the view ({})", app.viewport_h);
+            let now = app.block_tops[b] - app.content_rect.top();
+            assert!((now - before).abs() <= 1.0, "f{f} after the flip: block {b} is {now} below the view top, was {before}");
+            f += 1;
+        });
+        // The watcher holds the folder open on Windows.
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn real_app_empty_and_single_block_documents() {
         let dir = std::env::temp_dir().join(format!("mdread-rt-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3590,6 +3677,11 @@ mod tests {
         /// `Some(e)`: as a document over 600 blocks (no measuring of every block), an unmeasured
         /// block is given `e` pt.
         estimate: Option<f32>,
+        /// With `estimate`, blocks drawn at their real height even before they are measured, so
+        /// they are laid out (and measured) wherever that height reaches into the view; the
+        /// blocks above stay estimates. Frame 0's key change clears `measured`, so starting them
+        /// measured would not survive it.
+        known: Vec<usize>,
         /// `pending_offset` before frame 0, placed as a load's (last frame showed another document).
         start: f32,
         /// `anchor.hold` before frame 0: Back's restore, or a command-line `#anchor`.
@@ -3603,6 +3695,7 @@ mod tests {
         frames: usize,
     }
 
+    #[derive(Clone)]
     enum Step {
         /// A key scroll by this many points (+ = down): `scroll_with_delta` in the scroll area,
         /// and `after`'s `scroll_delta`, as `show_content` does with one; in the frame's first
@@ -3633,6 +3726,16 @@ mod tests {
         /// From this frame on, this much space above the scroll area: the view top moves without
         /// scrolling, as when the search bar opens or closes.
         Inset(f32),
+        /// Home or End: this offset placed, and no hold.
+        Offset(f32),
+        /// Block `i` loads again and lays out at this height until its next `Grow` (a diagram
+        /// redrawn for a new theme shows its placeholder); not pending before this frame.
+        Pend(usize, f32),
+        /// `request_discard` in the frame's first pass, as egui does for its own reasons.
+        Discard,
+        /// `scroll_to_rect` on block `i`'s rect in the frame's first pass, issued right after the
+        /// block is allocated (its rect is known only then); animated, as selection edge scrolling.
+        EguiScrollTo(usize),
     }
 
     /// One frame as shown, taken from its last pass.
@@ -3651,6 +3754,8 @@ mod tests {
         view: Option<(usize, f32)>,
         /// The page end minus the view top: under the view height, blank below the end.
         to_end: f32,
+        /// egui's content height plus the shift: the length of the page as shown.
+        true_h: f32,
         /// The column Ui's rect was the right way up in every pass.
         col_ok: bool,
     }
@@ -3688,6 +3793,7 @@ mod tests {
                 events.push(primary(p, false));
             }
             let mut scroll_delta = 0.0;
+            let (mut discard, mut scroll_to) = (false, None);
             // As at launch, where `layout_key` starts at (0, 0).
             let mut relayout = f == 0;
             for (_, step) in s.steps.iter().filter(|(sf, _)| *sf == f) {
@@ -3713,7 +3819,7 @@ mod tests {
                             pending_offset = Some(o);
                         }
                     }
-                    &Step::Grow(i, h) => heights[i] = h,
+                    &Step::Grow(i, h) | &Step::Pend(i, h) => heights[i] = h,
                     Step::Relayout(k, set) => {
                         for h in &mut heights {
                             *h *= k;
@@ -3740,10 +3846,18 @@ mod tests {
                         anchor.restore(at, n);
                     }
                     &Step::Inset(h) => inset = h,
+                    &Step::Offset(y) => {
+                        pending_offset = Some(y);
+                        anchor.clear_hold();
+                    }
+                    Step::Discard => discard = true,
+                    &Step::EguiScrollTo(i) => scroll_to = Some(i),
                 }
             }
-            // A block is pending (a loading image) until the frame its Grow step lands.
-            let pending: Vec<bool> = (0..n).map(|i| s.steps.iter().any(|(g, st)| *g > f && matches!(st, Step::Grow(j, _) if *j == i))).collect();
+            // A block is pending (a loading image) until the frame its Grow step lands, and from a
+            // Pend step on, not before it.
+            let later = |i: usize, pend: bool| s.steps.iter().any(|(g, st)| *g > f && matches!(st, Step::Grow(j, _) | Step::Pend(j, _) if *j == i && matches!(st, Step::Pend(..)) == pend));
+            let pending: Vec<bool> = (0..n).map(|i| later(i, false) && !later(i, true)).collect();
             let mut viewports = egui::ViewportIdMap::default();
             viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { native_pixels_per_point: Some(1.5), ..Default::default() });
             let input = egui::RawInput {
@@ -3763,6 +3877,10 @@ mod tests {
                 // show_content takes the key delta once per frame: a pass egui runs after a discard
                 // gets no events, so it neither scrolls again nor counts as the reader scrolling.
                 let scroll_delta = if passes == 1 { scroll_delta } else { 0.0 };
+                let scroll_to = scroll_to.filter(|_| passes == 1);
+                if discard && passes == 1 {
+                    ui.ctx().request_discard("test");
+                }
                 if inset > 0.0 {
                     ui.add_space(inset);
                 }
@@ -3795,13 +3913,16 @@ mod tests {
                                 col_ok &= ui.max_rect().min.y < ui.max_rect().max.y;
                             }
                             let m = measures[i];
-                            let est = if m.measured { m.height } else { s.estimate.unwrap_or(heights[i]) };
+                            let est = if m.measured { m.height } else if s.known.contains(&i) { heights[i] } else { s.estimate.unwrap_or(heights[i]) };
                             let in_view = top <= visible.max.y && top + est >= visible.min.y;
                             if lay_out_block(m, in_view, all, anchor.holds(i), i + 1 == n) {
                                 ui.allocate_space(vec2(COL_W, heights[i]));
                                 measures[i] = Measure { height: ui.cursor().top() - top, measured: true, pending: pending[i] };
                             } else {
                                 ui.allocate_space(vec2(COL_W, est));
+                            }
+                            if scroll_to == Some(i) {
+                                ui.scroll_to_rect(Rect::from_min_max(pos2(col_x, top), pos2(col_x + COL_W, ui.cursor().top())), None);
                             }
                         }
                     });
@@ -3821,6 +3942,7 @@ mod tests {
                     hold: anchor.hold,
                     view: anchor.view,
                     to_end: anchor.pass.page_end - view_top,
+                    true_h: out.content_size.y + anchor.shift,
                     col_ok: true,
                 });
             });
@@ -3846,7 +3968,7 @@ mod tests {
     }
 
     fn scenario(heights: Vec<f32>, start: f32, hold: Option<(usize, f32)>, steps: Vec<(usize, Step)>, frames: usize) -> Scenario {
-        Scenario { heights, estimate: None, start, hold, hold_h: None, max_passes: 2, steps, frames }
+        Scenario { heights, estimate: None, known: vec![], start, hold, hold_h: None, max_passes: 2, steps, frames }
     }
 
     /// Block `b` at the view top with `x` pt of it above the view.
@@ -3941,8 +4063,8 @@ mod tests {
             assert!(x.hold.is_none(), "(c) f{f}: {x:?}");
         }
         // Ctrl+wheel zooms; it does not scroll. egui routes it to zoom, so the offset does not move and this
-        // row pins that routing; the `!modifiers.command` filter in `after` is defensive, for a frame where
-        // egui also moves the offset.
+        // row pins that routing. The `!modifiers.command` filter in `after` matters in a frame where egui
+        // also moves the offset: a_ctrl_wheel_while_egui_scrolls_does_not_release_a_hold pins it.
         let s = run("(d)", held_24(vec![(4, Step::Wheel(120.0, Modifiers::COMMAND))]));
         for (f, x) in s.iter().enumerate() {
             assert!(held(x, 24, -30.0, 1.0), "(d) f{f}: {x:?}");
@@ -4163,6 +4285,300 @@ mod tests {
                 assert!(at(x, 20, want, 1.0), "(j) f{f}: {x:?}");
             }
             assert!(held(x, 20, -800.0, 1.0), "(j) f{f}: hold: {x:?}");
+        }
+    }
+
+    /// Frame by frame, the ref's top block drawn within `tol` of where the ref draws it (`r` is the
+    /// run to compare with). Not the same block at the view top: on a block boundary `block_at` can
+    /// name the block before in one run and the one after in the other for the same place.
+    fn same_as_ref(a: &[Shown], r: &[Shown], tol: f32) -> Result<(), String> {
+        if a.len() != r.len() {
+            return Err(format!("{} frames, ref {}", a.len(), r.len()));
+        }
+        for (f, (x, y)) in a.iter().zip(r).enumerate() {
+            let ok = match (x.top, y.top) {
+                (Some(_), Some((yb, yr))) => (x.rel_tops[yb] - yr).abs() <= tol,
+                (None, None) => true,
+                _ => false,
+            };
+            if !ok {
+                return Err(format!("f{f}: {x:?}, ref {y:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `s` without its `Grow`, `Pend` and `Relayout` steps: the run to compare with.
+    fn without_growth(s: &Scenario) -> Scenario {
+        let steps = s.steps.iter().filter(|(_, st)| !matches!(st, Step::Grow(..) | Step::Pend(..) | Step::Relayout(..))).cloned().collect();
+        Scenario { heights: s.heights.clone(), known: s.known.clone(), steps, ..*s }
+    }
+
+    /// Runs `s` and its run without growth, and asserts they show the same place in every frame.
+    fn as_ref(name: &str, s: Scenario, tol: f32) -> Vec<Shown> {
+        let r = run(&format!("{name} ref"), without_growth(&s));
+        let shown = run(name, s);
+        if let Err(e) = same_as_ref(&shown, &r, tol) {
+            panic!("{name}: not as without growth: {e}");
+        }
+        shown
+    }
+
+    /// The length of the page in frame `f`: the heights with the `Grow` steps up to `f` applied,
+    /// the top padding (19.2) and what follows the last block (102).
+    fn page_len(s: &Scenario, f: usize) -> f32 {
+        let mut h = s.heights.clone();
+        for (g, st) in &s.steps {
+            if let &Step::Grow(i, x) = st {
+                if *g <= f {
+                    h[i] = x;
+                }
+            }
+        }
+        h.iter().sum::<f32>() + 19.2 + 102.0
+    }
+
+    #[test]
+    fn growth_above_leaves_the_text_still() {
+        as_ref("(a)", scenario(page_h(), 2000.0, None, vec![(4, Step::Grow(2, 600.0))], 10), 1.0);
+        // Growth larger than the distance from the grown block to the view.
+        let s = run("(b)", scenario(page_h(), 400.0, None, vec![(4, Step::Grow(2, 3000.0))], 8));
+        let (b, rel) = s[0].top.expect("a block at the top");
+        for (f, x) in s.iter().enumerate() {
+            assert!(at(x, b, -rel, 1.0), "(b) f{f}: {x:?}, f0 {:?}", s[0]);
+        }
+        // At rest in block 24's last 16 pt, its trailing gap: drawn where it is.
+        let s = run("(c)", scenario(page_h(), 2438.2, None, vec![], 10));
+        let (b, rel) = s[0].top.expect("a block at the top");
+        for (f, x) in s.iter().enumerate() {
+            assert!(at(x, b, -rel, 0.5) && x.shift == 0.0, "(c) f{f}: {x:?}, f0 {:?}", s[0]);
+        }
+    }
+
+    #[test]
+    fn key_scroll_ends_where_it_would_without_growth() {
+        as_ref("(a)", scenario(page_h(), 2000.0, None, vec![(2, Step::Key(300.0)), (4, Step::Grow(2, 600.0))], 26), 1.0);
+        as_ref("(b)", scenario(page_h(), 2000.0, None, vec![(2, Step::Key(300.0)), (8, Step::Key(300.0)), (5, Step::Grow(2, 600.0)), (10, Step::Grow(3, 700.0))], 36), 1.0);
+        let mut steps: Vec<_> = (2..=29).step_by(3).map(|f| (f, Step::Key(140.0))).collect();
+        steps.extend([(10, Step::Grow(2, 600.0)), (20, Step::Grow(3, 900.0))]);
+        as_ref("(c)", scenario(page_h(), 1000.0, None, steps, 50), 1.0);
+    }
+
+    #[test]
+    fn key_scroll_at_the_end_with_growth_above_stays_at_the_end() {
+        let rows = [
+            ("(a)", scenario(page_h(), 1e6, None, vec![(2, Step::Key(300.0)), (4, Step::Grow(2, 600.0))], 26), true, true),
+            ("(b)", scenario(page_h(), 5244.0, None, vec![(2, Step::Key(300.0)), (3, Step::Grow(2, 600.0))], 26), true, false),
+            ("(c)", scenario(page_h(), 1e6, None, vec![(2, Step::Key(300.0)), (4, Step::Grow(2, 3000.0))], 26), true, true),
+            ("(d)", scenario(page_with(2, 600.0), 1e6, None, vec![(4, Step::Grow(2, 24.0))], 10), false, true),
+            ("(e)", scenario(page_h(), 1e6, None, vec![(4, Step::Grow(2, 600.0))], 10), false, true),
+        ];
+        for (name, s, vs_ref, end) in rows {
+            let len: Vec<f32> = (0..s.frames).map(|f| page_len(&s, f)).collect();
+            let shown = if vs_ref { as_ref(name, s, 1.0) } else { run(name, s) };
+            for (f, x) in shown.iter().enumerate() {
+                if end && f >= 1 {
+                    assert!(at_end(x), "{name} f{f}: not at the end: {x:?}");
+                }
+                // An inflated content_size, or a column end read from min_rect, would show here.
+                assert!((x.true_h - len[f]).abs() <= 0.5, "{name} f{f}: true_h {}, the page is {}: {x:?}", x.true_h, len[f]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_egui_scroll_to_with_growth_ends_where_it_would() {
+        as_ref("scroll_to", scenario(page_h(), 2000.0, None, vec![(2, Step::EguiScrollTo(26)), (4, Step::Grow(2, 600.0))], 30), 1.0);
+    }
+
+    #[test]
+    fn a_discarded_pass_changes_nothing() {
+        // Also against the run with neither growth nor discards: `as_ref` alone keeps the discards in
+        // its ref, so a discard that moved the place without any growth would move both runs alike.
+        // The place kept (`view`) and the shift match in every frame. What a discarded frame draws
+        // does not during a key ease: egui's second pass starts from the offset its first pass
+        // already stepped, so that frame shows the ease one frame early, with or without anchoring.
+        let check = |name: &str, s: Scenario| {
+            let discards: Vec<usize> = s.steps.iter().filter(|(_, st)| matches!(st, Step::Discard)).map(|(f, _)| *f).collect();
+            let mut bare = without_growth(&s);
+            bare.steps.retain(|(_, st)| !matches!(st, Step::Discard));
+            let bare = run(&format!("{name} bare"), bare);
+            let with = run(&format!("{name} ref"), without_growth(&s));
+            as_ref(name, s, 1.0);
+            for (f, (x, y)) in with.iter().zip(&bare).enumerate() {
+                let (Some((vb, vr)), Some((yb, yr))) = (x.view, y.view) else { panic!("{name} f{f}: no view: {x:?}, bare {y:?}") };
+                let view_ok = vb == yb && (vr - yr).abs() <= 1.0;
+                let drawn_ok = discards.contains(&f) || y.top.is_some_and(|(b, r)| (x.rel_tops[b] - r).abs() <= 1.0);
+                assert!(view_ok && drawn_ok && x.shift == y.shift, "{name} f{f}: not as without discards: {x:?}, bare {y:?}");
+            }
+        };
+        check("(a)", scenario(page_h(), 2000.0, None, vec![(4, Step::Grow(2, 600.0)), (4, Step::Discard), (5, Step::Discard)], 10));
+        check("(b)", scenario(page_h(), 2000.0, None, vec![(2, Step::Key(300.0)), (4, Step::Grow(2, 600.0)), (4, Step::Discard), (6, Step::Discard)], 26));
+    }
+
+    #[test]
+    fn end_from_mid_page_is_egui_s_own_spring() {
+        // End puts the offset a screen past the page end and egui springs it back. The view top is
+        // then in the bottom padding, which `block_at` counts as part of the last block: drawing that
+        // place a line inside the block would pull the content down at once.
+        let s = run("end", scenario(vec![100.0; 60], 2000.0, None, vec![(4, Step::Offset(f32::MAX))], 90));
+        for (f, x) in s.iter().enumerate() {
+            assert!(x.shift == 0.0, "f{f}: shift: {x:?}");
+            if f >= 5 {
+                assert!(x.to_end >= s[f - 1].to_end - 0.01, "f{f}: the end moved back up: {x:?} after {:?}", s[f - 1]);
+            }
+        }
+        assert!(s[5].to_end < 20.0, "f5: not egui's first spring step: {:?}", s[5]);
+        assert!(at_end(&s[89]), "f89: not at the end: {:?}", s[89]);
+    }
+
+    #[test]
+    fn a_diagram_redrawn_under_the_view_keeps_the_place() {
+        // No hold: 800 pt into block 20, the 1,200 pt diagram. A new theme sends it back to a 30 pt
+        // placeholder for six frames, then it is drawn again at its height.
+        let steps = vec![(4, Step::Pend(20, 30.0)), (10, Step::Grow(20, 1200.0))];
+        let s = run("theme", scenario(page_t(20), 2819.2, None, steps, 16));
+        for (f, x) in s.iter().enumerate() {
+            assert!(x.top.is_some_and(|(b, _)| b == 20), "f{f}: a later block at the view top: {x:?}");
+            if !(4..10).contains(&f) {
+                assert!(at(x, 20, 800.0, 1.0), "f{f}: {x:?}");
+                assert!(x.view.is_some_and(|(b, rel)| b == 20 && (rel + 800.0).abs() <= 1.0), "f{f}: view: {x:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_ctrl_wheel_while_egui_scrolls_does_not_release_a_hold() {
+        // egui scrolls towards block 40 (selection edge scrolling) and a Ctrl+wheel (a zoom) comes
+        // in meanwhile: the offset moves in that frame, but not for the reader.
+        let steps = vec![(4, Step::EguiScrollTo(40)), (6, Step::Wheel(120.0, Modifiers::COMMAND))];
+        let s = run("ctrl", scenario(page_h(), 2626.0, Some((24, -30.0)), steps, 40));
+        for (f, x) in s.iter().enumerate() {
+            assert!(held(x, 24, -30.0, 1.0), "f{f}: {x:?}");
+        }
+    }
+
+    #[test]
+    fn a_moved_view_top_keeps_the_reading_place() {
+        // No hold: the search bar opens (the view top moves without scrolling), then a block above
+        // grows. The place is taken from the view top each frame, so a stale one would move it.
+        let s = as_ref("inset", scenario(page_h(), 2000.0, None, vec![(4, Step::Inset(40.0)), (6, Step::Grow(2, 600.0))], 12), 1.0);
+        let (b, rel) = s[0].top.expect("a block at the top");
+        for (f, x) in s.iter().enumerate() {
+            assert!(at(x, b, -rel, 1.0), "f{f}: {x:?}, f0 {:?}", s[0]);
+        }
+    }
+
+    #[test]
+    fn estimates_above_do_not_jolt_scrolling_up() {
+        // Over 600 blocks, the blocks above are estimates (70 pt) until scrolling up measures them.
+        // 76 frames: egui's smooth wheel scroll runs about 14 frames past the last turn (f58), and
+        // the shift moves in only after it.
+        let steps = || (2..=58).step_by(8).map(|f| (f, Step::Wheel(-300.0, Modifiers::NONE))).collect::<Vec<_>>();
+        let s = run("estimates", Scenario { estimate: Some(70.0), ..scenario(vec![100.0; 60], 3519.2, Some((50, 0.0)), steps(), 76) });
+        let r = run("measured", scenario(vec![100.0; 60], 5019.2, Some((50, 0.0)), steps(), 76));
+        if let Err(e) = same_as_ref(&s, &r, 1.5) {
+            panic!("not as an all-measured page: {e}");
+        }
+    }
+
+    #[test]
+    fn a_column_width_change_keeps_the_top_block() {
+        let s = run("1.5", scenario(vec![100.0; 60], 2049.2, None, vec![(4, Step::Relayout(1.5, vec![]))], 10));
+        for (f, x) in s.iter().enumerate() {
+            let want = if f < 4 { 30.0 } else { 45.0 };
+            assert!(at(x, 20, want, 1.0), "f{f}: {x:?}");
+            assert!(x.passes == if f == 4 { 2 } else { 1 }, "f{f}: passes: {x:?}");
+        }
+    }
+
+    #[test]
+    fn a_column_width_change_keeps_a_tall_top_block() {
+        // No hold: 800 pt into block 20, the 1,200 pt diagram, whose top is at 19.2 + 20 × 100.
+        let at_20 = |mut steps: Vec<(usize, Step)>, change: Step| {
+            steps.push((4, change));
+            scenario(page_t(20), 2819.2, None, steps, 10)
+        };
+        let halve = || Step::Relayout(1.0, vec![(20, 600.0)]);
+        // The diagram halves at f4: the place is kept in proportion, with one discarded pass.
+        let rescaled = |name: &str, s: &[Shown], x: f32| {
+            for (f, y) in s.iter().enumerate() {
+                let want = if f < 4 { 800.0 } else { x };
+                assert!(at(y, 20, want, 1.0), "{name} f{f}: {y:?}");
+                assert!(y.passes == if f == 4 { 2 } else { 1 }, "{name} f{f}: passes: {y:?}");
+            }
+        };
+        let s = run("(a)", at_20(vec![], halve()));
+        rescaled("(a)", &s, 400.0);
+        let settled = |name: &str, s: &[Shown]| {
+            for (f, y) in s.iter().enumerate().skip(5) {
+                assert!(y.shift == 0.0, "{name} f{f}: shift: {y:?}");
+            }
+            for f in 7..10 {
+                assert!(same(&s[f], &s[6]), "{name} f{f}: not the same as f6: {:?} vs {:?}", s[f], s[6]);
+            }
+        };
+        settled("(a)", &s);
+        let s = run("(b)", at_20(vec![], Step::Relayout(1.0, vec![(20, 2400.0)])));
+        for (f, y) in s.iter().enumerate().skip(4) {
+            assert!(at(y, 20, 1600.0, 1.0), "(b) f{f}: {y:?}");
+        }
+        let s = run("(c)", at_20(vec![], Step::Relayout(1.25, vec![(20, 600.0)])));
+        for (f, y) in s.iter().enumerate().skip(4) {
+            assert!(at(y, 20, 400.0, 1.0), "(c) f{f}: {y:?}");
+        }
+        // Near the end: no lower than the page end allows.
+        let s = run("(d)", scenario(page_t(57), 6519.2, None, vec![(4, Step::Relayout(1.0, vec![(57, 600.0)]))], 10));
+        for (f, y) in s.iter().enumerate() {
+            assert!(y.to_end >= 599.5, "(d) f{f}: blank below the end: {y:?}");
+            if f >= 4 {
+                assert!(y.top.is_some_and(|(b, _)| b == 57) && at_end(y), "(d) f{f}: {y:?}");
+            }
+        }
+        // The blocks above stay estimates; the diagram is drawn at its height from frame 0.
+        let s = run("(e)", Scenario { estimate: Some(70.0), known: vec![20], ..scenario(page_t(20), 2219.2, None, vec![(4, halve())], 10) });
+        for (f, y) in s.iter().enumerate().skip(4) {
+            assert!(at(y, 20, 400.0, 1.0), "(e) f{f}: {y:?}");
+            if f >= 6 {
+                assert!(y.shift == 0.0, "(e) f{f}: shift: {y:?}");
+            }
+        }
+        // Home in the relayout frame: a placed offset is a new position, not one to keep.
+        let s = run("(f)", at_20(vec![(4, Step::Offset(0.0))], halve()));
+        for (f, y) in s.iter().enumerate() {
+            if f >= 4 {
+                assert!(y.top.is_none(), "(f) f{f}: not at the page top: {y:?}");
+            }
+            assert!(y.passes == 1, "(f) f{f}: passes: {y:?}");
+        }
+        // A jump in the relayout frame: a jump hold is not rescaled.
+        let s = run("(g)", at_20(vec![(4, Step::Jump(30))], halve()));
+        for (f, y) in s.iter().enumerate() {
+            if f >= 4 {
+                assert!(at_gap(y, 30, 1.0), "(g) f{f}: {y:?}");
+            }
+            assert!(y.passes == 1, "(g) f{f}: passes: {y:?}");
+        }
+        // During a key ease: 803 pt into block 20 at f4, halved, plus the 297 pt left of the ease
+        // (without the relayout it ends at b20+1100); never back up meanwhile, beyond the pixel
+        // rounding of the frame the shift moves in.
+        let s = run("(h)", Scenario { frames: 30, ..at_20(vec![(2, Step::Key(300.0))], halve()) });
+        assert!(at(&s[29], 21, 98.5, 1.5), "(h) f29: {:?}", s[29]);
+        for f in 5..30 {
+            let ((b, rel), (pb, prel)) = (s[f].top.expect("a block"), s[f - 1].top.expect("a block"));
+            assert!(b > pb || (b == pb && rel <= prel + 0.5), "(h) f{f}: above f{}: {:?} vs {:?}", f - 1, s[f], s[f - 1]);
+        }
+        // egui discarding the relayout frame's first pass for its own reasons.
+        let s = run("(i)", at_20(vec![(4, Step::Discard)], halve()));
+        rescaled("(i)", &s, 400.0);
+        settled("(i)", &s);
+        // The window narrowed at a fixed column width: no key change, the diagram rescales.
+        let s = run("(j)", at_20(vec![], Step::Resize(700.0, vec![(20, 600.0)])));
+        rescaled("(j)", &s, 400.0);
+        // A resize that rewraps nothing discards nothing.
+        let s = run("(k)", at_20(vec![], Step::Resize(700.0, vec![])));
+        for (f, y) in s.iter().enumerate() {
+            assert!(at(y, 20, 800.0, 1.0) && y.passes == 1, "(k) f{f}: {y:?}");
         }
     }
 }
